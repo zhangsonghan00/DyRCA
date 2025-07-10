@@ -1,0 +1,25 @@
+[project]
+name = "art"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0.2",
+    "scipy>=1.16.0",
+    "ruff",
+    "tqdm>=4.67.1",
+    "scikit-learn>=1.7.0",
+    "dgl",
+    "numpy>=2.3.1",
+    "pandas>=2.3.0",
+    "matplotlib>=3.10.3",
+    "pyarrow>=20.0.0",
+    "wandb>=0.20.1",
+    "polars>=1.31.0",
+    "loguru>=0.7.3",
+    "rcabench>=1.0.19",
+]
+[tool.uv.sources]
+dgl = { url = "https://data.dgl.ai/wheels/torch-2.4/cu124/dgl-2.4.0%2Bcu124-cp312-cp312-manylinux1_x86_64.whl" }
+torch = { url = "https://download.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp312-cp312-linux_x86_64.whl" }
