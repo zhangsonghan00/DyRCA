@@ -13,6 +13,7 @@ import os
 from rcabench.openapi import InjectionApi, ApiClient, Configuration
 
 import statistics  # For trace latency std calculation
+import typer
 
 from enum import Enum, auto  # Import Enum base class and auto value generator
 
@@ -26,14 +27,13 @@ class Dataset(Enum):  # Define an Enum class named Dataset, inheriting from Enum
 # Configuration parameters
 SAMPLING_SIZE = 5  # Data smoothing granularity: 5 seconds
 WINDOW_SIZE = 10  # Sliding window size: 10 sampling points
+SLIDING_STEP = 1  # Sliding step size
 
 
 def create_dataset(
     data_root: str,
     output_dir: str,
     max_cases: Optional[int] = None,
-    train_ratio: float = 0.7,
-    enable_checkpointing: bool = True,
     ds: str = "rcabench",
 ) -> List[Path]:
     if ds == "rcabench":
@@ -56,6 +56,7 @@ def create_dataset(
         case_names = list(
             set([item.injection_name for item in resp.data if item.injection_name])
         )
+        # case_names = os.listdir(data_root)
         data_packs = [Path(data_root) / name / "converted" for name in case_names]
 
         data_packs = data_packs[:max_cases]
@@ -84,10 +85,13 @@ def create_dataset(
         # Traverse directory
         for root, dirs, files in os.walk(data_root):
             for dir_name in dirs:
-                if any(sample in dir_name for sample in service_select):
+                # if any(sample in dir_name for sample in service_select):
+                if "ts" in dir_name:
                     service_path_name.append(dir_name)
 
         data_packs = [Path(data_root) / name for name in service_path_name]
+
+        data_packs = data_packs[:max_cases]
 
     return data_packs
 
@@ -238,56 +242,14 @@ class DataPreprocessor:
                 .reset_index()
             )
             trace_stats.columns = ["service", "avg_duration", "request_count"]
-            # === Add trace latency features ===
-            latency_p90_list = []
-            latency_std_list = []
-            for service in self.services:
-                service_spans = window_data[window_data["extracted_service"] == service]
-                parent_span_df = window_data.set_index("span_id")
-                latency_list = []
-                for _, span in service_spans.iterrows():
-                    parent_id = span["parent_span_id"]
-                    span_time = span["time"]
-                    span_duration = span["duration"]
-                    if parent_id is None or pd.isna(parent_id) or parent_id == "":
-                        continue
-                    try:
-                        if parent_id in parent_span_df.index:
-                            parent_span = parent_span_df.loc[parent_id]
-                            if isinstance(parent_span, pd.Series):
-                                if parent_span["extracted_service"] != service:
-                                    latency = span_duration / 1000
-                                    latency_list.append(latency)
-                            else:
-                                for _, p_span in parent_span.iterrows():
-                                    if p_span["extracted_service"] != service:
-                                        latency = span_duration / 1000
-                                        latency_list.append(latency)
-                    except Exception:
-                        continue
-                if len(latency_list) > 2:
-                    latency_p90 = np.percentile(latency_list, 90)
-                    latency_std = statistics.stdev(latency_list)
-                else:
-                    latency_p90 = 1
-                    latency_std = 1
-                latency_p90_list.append(latency_p90)
-                latency_std_list.append(latency_std)
-            # === END ===
             feature_matrix = torch.zeros(
-                (len(self.services), 4)
+                (len(self.services), 2)
             )  # duration, count, latency_p90, latency_std
             for idx, row in trace_stats.iterrows():
                 service_idx = self.service_to_idx.get(row["service"])
                 if service_idx is not None:
                     feature_matrix[service_idx, 0] = row["avg_duration"]
                     feature_matrix[service_idx, 1] = row["request_count"]
-            for i, (lat_p90, lat_std) in enumerate(
-                zip(latency_p90_list, latency_std_list)
-            ):
-                feature_matrix[i, 2] = lat_p90
-                feature_matrix[i, 3] = lat_std
-            trace_features[window] = feature_matrix
 
             # 2. Collect edge info (do not build graph immediately)
             edge_stats = (
@@ -403,7 +365,7 @@ class DataPreprocessor:
             if window in trace_features:
                 feature_list.append(trace_features[window])
             else:
-                feature_list.append(torch.zeros((len(self.services), 4)))
+                feature_list.append(torch.zeros((len(self.services), 2)))
 
             # Add log features
             if window in log_features:
@@ -463,10 +425,8 @@ class DatasetPack:
         if all_services is None:
             all_services = [f"service_{i}" for i in range(self.features[0].shape[0])]
 
-        service_to_idx = {service: i for i, service in enumerate(all_services)}
-
         samples = []
-        for i in range(len(self.features) - window_size + 1):
+        for i in range(0, len(self.features) - window_size + 1, SLIDING_STEP):
             # Check if time interval is reasonable
             time_diffs = [
                 abs(self.timestamps[i + j + 1] - self.timestamps[i + j])
@@ -610,7 +570,7 @@ def collect_all_services_and_metrics(
         metrics = df["metric"].unique()
         all_metrics.update(metrics)
 
-        print(f"Case {case_dir.name}: {len(services)} services, {len(metrics)} metrics")
+        typer.echo(f"Case {case_dir.name}: {len(services)} services, {len(metrics)} metrics")
 
     return sorted(all_services), sorted(all_metrics)
 
@@ -647,7 +607,7 @@ def create_labels_for_case(
 
     if not env_path.exists() or not inj_path.exists():
         # If no injection info, return all-zero labels
-        print("no label:", case_dir)
+        typer.echo(f"no label: {case_dir}")
         return [torch.zeros(len(all_services)) for _ in timestamps]
 
     with open(env_path) as f:
@@ -671,10 +631,10 @@ def create_labels_for_case(
             # Check if the time is within the fault time range
             ab_start = pd.to_datetime(
                 int(env["ABNORMAL_START"]), unit="s", utc=True
-            ) - pd.Timedelta(hours=8)
+            )
             ab_end = pd.to_datetime(
                 int(env["ABNORMAL_END"]), unit="s", utc=True
-            ) - pd.Timedelta(hours=8)
+            )
             ab_start = int(ab_start.timestamp())
             ab_end = int(ab_end.timestamp())
             window_start = timestamp * SAMPLING_SIZE
@@ -754,14 +714,14 @@ def main():
         max_cases=30,
         ds="rcabench_filtered",
     )
-    print(f"Found {len(data_packs)} data packs")
+    typer.echo(f"Found {len(data_packs)} data packs")
 
     # Collect all services and metrics
     all_services, all_metrics = collect_all_services_and_metrics(
         data_packs, "abnormal_metrics.parquet"
     )
-    print(f"Found {len(all_services)} services: {all_services}")
-    print(f"Found {len(all_metrics)} metrics: {all_metrics}")
+    typer.echo(f"Found {len(all_services)} services: {all_services}")
+    typer.echo(f"Found {len(all_metrics)} metrics: {all_metrics}")
 
     # Save global service_to_idx and metric_to_idx
     service_to_idx = {service: i for i, service in enumerate(all_services)}
@@ -832,12 +792,12 @@ def main():
     # Save data
     logger.info(f"Saving {len(abnormal_samples)} abnormal samples...")
     with open(
-        os.path.join(output_dir, "samples", "abnormal_samples_latency.pkl"), "wb"
+        os.path.join(output_dir, "samples", "abnormal_samples.pkl"), "wb"
     ) as f:
         pickle.dump(abnormal_samples, f)
 
     with open(
-        os.path.join(output_dir, "samples", "abnormal_labels_latency.pkl"), "wb"
+        os.path.join(output_dir, "samples", "abnormal_labels.pkl"), "wb"
     ) as f:
         pickle.dump(abnormal_sample_labels, f)
 
@@ -845,15 +805,15 @@ def main():
 
     # Output statistics
     if abnormal_samples:
-        print(len(abnormal_samples), "abnormal samples")
+        typer.echo(f"{len(abnormal_samples)} abnormal samples")
         sample_features, sample_graph = abnormal_samples[0]
-        print(f"Sample feature shape: {sample_features.shape}")
-        print(f"Graph node count: {sample_graph.num_nodes()}")
-        print(f"Graph edge count: {sample_graph.num_edges()}")
-        print(
+        typer.echo(f"Sample feature shape: {sample_features.shape}")
+        typer.echo(f"Graph node count: {sample_graph.num_nodes()}")
+        typer.echo(f"Graph edge count: {sample_graph.num_edges()}")
+        typer.echo(
             f"Label shape: {abnormal_sample_labels[0].shape if abnormal_sample_labels else 'N/A'}"
         )
-        print(abnormal_sample_labels[0])
+        typer.echo(abnormal_sample_labels[0])
 
 
 def run_preprocessing(
@@ -870,21 +830,21 @@ def run_preprocessing(
     data_packs = create_dataset(
         data_root=data_root, output_dir="data", max_cases=max_cases, ds=ds
     )
-    print(f"Found {len(data_packs)} data packs")
+    typer.echo(f"Found {len(data_packs)} data packs")
 
     # Collect all services and metrics
     all_services, all_metrics = collect_all_services_and_metrics(
         data_packs, "abnormal_metrics.parquet"
     )
-    print(f"Found {len(all_services)} services: {all_services}")
-    print(f"Found {len(all_metrics)} metrics: {all_metrics}")
+    typer.echo(f"Found {len(all_services)} services: {all_services}")
+    typer.echo(f"Found {len(all_metrics)} metrics: {all_metrics}")
 
     # Save global service_to_idx and metric_to_idx
     service_to_idx = {service: i for i, service in enumerate(all_services)}
     metric_to_idx = {metric: i for i, metric in enumerate(all_metrics)}
-    with open(os.path.join(output_dir, "service_to_idx.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "service_to_idx1.pkl"), "wb") as f:
         pickle.dump(service_to_idx, f)
-    with open(os.path.join(output_dir, "metric_to_idx.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "metric_to_idx1.pkl"), "wb") as f:
         pickle.dump(metric_to_idx, f)
 
     # Process abnormal data
@@ -941,7 +901,7 @@ def run_preprocessing(
     sample_idx = 0
     for case_labels in abnormal_labels_by_case:
         if len(case_labels) >= WINDOW_SIZE:
-            for i in range(len(case_labels) - WINDOW_SIZE + 1):
+            for i in range(0, len(case_labels) - WINDOW_SIZE + 1, SLIDING_STEP):
                 # Use the label of the last time as the sample label
                 abnormal_sample_labels.append(case_labels[i + WINDOW_SIZE - 1])
                 sample_idx += 1
@@ -949,12 +909,12 @@ def run_preprocessing(
     # Save data
     logger.info(f"Saving {len(abnormal_samples)} abnormal samples...")
     with open(
-        os.path.join(output_dir, "samples", "abnormal_samples_latency.pkl"), "wb"
+        os.path.join(output_dir, "samples", "abnormal_samples1.pkl"), "wb"
     ) as f:
         pickle.dump(abnormal_samples, f)
 
     with open(
-        os.path.join(output_dir, "samples", "abnormal_labels_latency.pkl"), "wb"
+        os.path.join(output_dir, "samples", "abnormal_labels1.pkl"), "wb"
     ) as f:
         pickle.dump(abnormal_sample_labels, f)
 
@@ -962,31 +922,96 @@ def run_preprocessing(
 
     # Output statistics
     if abnormal_samples:
-        print(len(abnormal_samples), "abnormal samples")
+        typer.echo(f"{len(abnormal_samples)} abnormal samples")
         sample_features, sample_graph = abnormal_samples[0]
-        print(f"Sample feature shape: {sample_features.shape}")
-        print(f"Graph node count: {sample_graph.num_nodes()}")
-        print(f"Graph edge count: {sample_graph.num_edges()}")
-        print(
+        typer.echo(f"Sample feature shape: {sample_features.shape}")
+        typer.echo(f"Graph node count: {sample_graph.num_nodes()}")
+        typer.echo(f"Graph edge count: {sample_graph.num_edges()}")
+        typer.echo(
             f"Label shape: {abnormal_sample_labels[0].shape if abnormal_sample_labels else 'N/A'}"
         )
-        print(abnormal_sample_labels[0])
+        typer.echo(abnormal_sample_labels[0])
 
     return {
         "num_samples": len(abnormal_samples),
         "num_services": len(all_services),
         "num_metrics": len(all_metrics),
         "samples_path": os.path.join(
-            output_dir, "samples", "abnormal_samples_latency.pkl"
+            output_dir, "samples", "abnormal_samples.pkl"
         ),
         "labels_path": os.path.join(
-            output_dir, "samples", "abnormal_labels_latency.pkl"
+            output_dir, "samples", "abnormal_labels.pkl"
         ),
     }
 
+def run_single_pack_preprocessing(
+        datapack_path: Path,
+        output_dir: str,
+        metric_file: str = "abnormal_metrics.parquet",
+        trace_file: str = "abnormal_traces.parquet",
+        log_file: str = "abnormal_logs.parquet",
+        sampling_size: int = SAMPLING_SIZE,
+        window_size: int = WINDOW_SIZE,
+        max_gap: int = 15,
+) -> dict:
+
+        output_dir = str(output_dir)
+        # load all_services and all_metrics
+        with open(os.path.join(output_dir, "service_to_idx.pkl"), "rb") as f:
+            service_to_idx = pickle.load(f)
+        with open(os.path.join(output_dir, "metric_to_idx.pkl"), "rb") as f:
+            metric_to_idx = pickle.load(f)
+        all_services = list(service_to_idx.keys())
+        all_metrics = list(metric_to_idx.keys())
+
+        # process single data pack
+        timestamps, features, edges = process_case(
+            datapack_path,
+            metric_file,
+            trace_file,
+            log_file,
+            all_services,
+            all_metrics,
+            sampling_size=sampling_size,
+        )
+
+        # normalize features
+        if features:
+            normalized_features = minmax_normalize_features(features)
+        else:
+            normalized_features = []
+
+        # sliding window sampling
+        pack = DatasetPack(timestamps, normalized_features, edges)
+        samples = pack.create_sliding_windows(
+            window_size=window_size, max_gap=max_gap, all_services=all_services
+        )
+
+        # create labels
+        labels = create_labels_for_case(datapack_path, timestamps, all_services)
+        sample_labels = []
+        if len(labels) >= window_size:
+            for i in range(len(labels) - window_size + 1):
+                sample_labels.append(labels[i + window_size - 1])
+
+        # save samples and labels
+        os.makedirs(os.path.join(output_dir, "samples"), exist_ok=True)
+        with open(os.path.join(output_dir, "samples", "single_pack_samples.pkl"), "wb") as f:
+            pickle.dump(samples, f)
+        with open(os.path.join(output_dir, "samples", "single_pack_labels.pkl"), "wb") as f:
+            pickle.dump(sample_labels, f)
+
+        typer.echo(f"单个 data_pack 处理完成，样本数: {len(samples)}，标签数: {len(sample_labels)}")
+        if samples:
+            typer.echo(f"Sample feature shape: {samples[0][0].shape}")
+            typer.echo(f"Graph: {samples[0][1]}")
+        return {"samples": samples, "sample_labels": sample_labels}
+
 
 if __name__ == "__main__":
-    main()
+    # main()
+    data_pack=Path("/mnt/jfs/rcabench_dataset/ts5-ts-ui-dashboard-request-replace-method-fjhvwr/converted")
+    x=run_single_pack_preprocessing(data_pack, output_dir="data/RCABENCH")
     # path= Path(__file__).parent / 'data/RCABENCH/samples/abnormal_samples.pkl'
     # with open(path, 'rb') as f:
     #     abnormal_samples = pickle.load(f)

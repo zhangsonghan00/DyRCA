@@ -11,11 +11,17 @@ from src.rca.training import (
     load_model_and_metadata,
     prepare_data_loaders,
 )
-from src.rca.preprocess import run_preprocessing
+from src.rca.dataset import collate_fn
+from src.rca.incremental_training import incremental_train_model
+from src.rca.preprocess import run_preprocessing, run_single_pack_preprocessing
+from torch.utils.data import DataLoader
 import pickle
 import warnings
+from pathlib import Path
 
-warnings.filterwarnings("ignore", category=UserWarning, module="dgl")
+# 过滤特定的 PyTorch 警告
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 app = typer.Typer(help="PaDi-RCA: Root Cause Analysis Command Line Tool")
 
@@ -27,7 +33,7 @@ def preprocess(
         help="Root directory containing case data",
     ),
     output_dir: str = typer.Option(
-        "data/RCABENCH", help="Output directory for processed data"
+        "data/RCABENCH", help="Output dir/ectory for processed data"
     ),
     max_cases: Optional[int] = typer.Option(
         None, help="Maximum number of cases to process"
@@ -68,11 +74,12 @@ def preprocess(
 @app.command()
 def train(
     samples_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_samples.pkl", help="Path to samples pickle file"
+        "data/RCABENCH/samples/abnormal_samples1.pkl", help="Path to samples pickle file"
     ),
     labels_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_labels.pkl", help="Path to labels pickle file"
+        "data/RCABENCH/samples/abnormal_labels1.pkl", help="Path to labels pickle file"
     ),
+    seed: int = typer.Option(42, help="Random seed for data splitting"),
     output_model: str = typer.Option("best_rca_model.pth", help="Output model path"),
     epochs: int = typer.Option(20, help="Number of training epochs"),
     batch_size: int = typer.Option(32, help="Batch size for training"),
@@ -100,7 +107,12 @@ def train(
 
     # Load dataset
     typer.echo("Loading dataset...")
-    full_dataset = RCADataset(samples_path, labels_path)
+        # Load data
+    with open(samples_path, "rb") as f:
+        samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(labels_path, "rb") as f:
+        labels = pickle.load(f)  # list of tensors (length = num_nodes)
+    full_dataset = RCADataset(samples, labels)
 
     num_nodes = full_dataset.num_nodes
     feature_dim = full_dataset.samples[0][0].shape[-1]
@@ -111,7 +123,7 @@ def train(
 
     # Create data loaders
     train_loader, val_loader, test_loader = prepare_data_loaders(
-        full_dataset, batch_size=batch_size
+        full_dataset, batch_size=batch_size,seed=seed
     )
 
     # Initialize model
@@ -150,11 +162,12 @@ def train(
 @app.command()
 def test(
     samples_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_samples.pkl", help="Path to samples pickle file"
+        "data/RCABENCH/samples/abnormal_samples1.pkl", help="Path to samples pickle file"
     ),
     labels_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_labels.pkl", help="Path to labels pickle file"
+        "data/RCABENCH/samples/abnormal_labels1.pkl", help="Path to labels pickle file"
     ),
+    seed: int = typer.Option(42, help="Random seed for data splitting"),
     model_path: str = typer.Option("best_rca_model.pth", help="Path to trained model"),
     batch_size: int = typer.Option(32, help="Batch size for testing"),
     device: Optional[str] = typer.Option(None, help="Device to use (cuda/cpu)"),
@@ -185,7 +198,12 @@ def test(
 
     # Load dataset
     typer.echo("Loading dataset...")
-    full_dataset = RCADataset(samples_path, labels_path)
+
+    with open(samples_path, "rb") as f:
+        samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(labels_path, "rb") as f:
+        labels = pickle.load(f)  # list of tensors (length = num_nodes)
+    full_dataset = RCADataset(samples, labels)
 
     # Get model parameters from metadata or dataset
     num_nodes = metadata.get("num_nodes", full_dataset.num_nodes)
@@ -193,14 +211,76 @@ def test(
     hidden_dim = metadata.get("hidden_dim", 32)
     use_transformer = metadata.get("use_transformer", True)
 
-    # Create test data loader (use all data)
-    from torch.utils.data import DataLoader
-    from src.rca.dataset import collate_fn
+    # Create test data loader
+    _, _, test_loader = prepare_data_loaders(
+        full_dataset, batch_size=batch_size, seed=seed
+    )
 
+    # Initialize and load model
+    model = RCAModel(
+        num_services=num_nodes,
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        use_transformer=use_transformer,
+    ).to(device_obj)
+
+    model.load_state_dict(torch.load(model_path, map_location=device_obj))
+    typer.echo("Model loaded successfully")
+
+    # Run test
+    typer.echo("Starting testing...")
+    test_results,_ = test_model(model, test_loader, device_obj)
+
+    # Print test results
+    typer.echo("\nTest Results:")
+    typer.echo("-" * 40)
+    for metric, value in test_results.items():
+        typer.echo(f"{metric}: {value:.4f}")
+
+
+@app.command()
+def run_inference(
+    datapack_path: Path,
+    model_path: str = typer.Option("best_rca_model.pth", help="Path to trained model"),
+    output_dir: str = typer.Option(
+        "data/RCABENCH", help="Output directory for inference results"
+    ),
+    service_map_path: str = typer.Option(
+        "data/RCABENCH/service_to_idx.pkl", help="Path to service_to_idx.pkl mapping file" 
+    ),
+    batch_size: int = typer.Option(32, help="Batch size for testing"),
+):
+    # Set device
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    device_obj = torch.device(device_str)
+    typer.echo(f"Using device: {device_obj}")
+
+    """Run inference on a single datapack"""
+    preprocessed_data = run_single_pack_preprocessing(
+        datapack_path=datapack_path,
+        output_dir=output_dir,
+        )
+    samples=preprocessed_data["samples"]
+    labels=preprocessed_data["sample_labels"]
+
+    full_dataset = RCADataset(samples, labels)
+
+    # Load metadata
+    metadata_path = model_path.replace(".pth", "_metadata.pkl")
+    metadata = load_model_and_metadata(model_path, metadata_path)
+
+    # Get model parameters from metadata or dataset
+    num_nodes = metadata.get("num_nodes", full_dataset.num_nodes)
+    feature_dim = metadata.get("feature_dim", full_dataset.samples[0][0].shape[-1])
+    hidden_dim = metadata.get("hidden_dim", 32)
+    use_transformer = metadata.get("use_transformer", True)
+
+    # Create test data loader
     test_loader = DataLoader(
         full_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         collate_fn=collate_fn,
         num_workers=4,
     )
@@ -217,15 +297,19 @@ def test(
     typer.echo("Model loaded successfully")
 
     # Run test
-    typer.echo("Starting testing...")
-    test_results = test_model(model, test_loader, device_obj)
+    typer.echo("Starting inference...")
+    test_results,top_k_results = test_model(model, test_loader, device_obj)
 
-    # Print test results
-    typer.echo("\nTest Results:")
-    typer.echo("-" * 40)
-    for metric, value in test_results.items():
-        typer.echo(f"{metric}: {value:.4f}")
+    top_k_result=top_k_results[0]
 
+    with open(service_map_path, "rb") as f:
+        service_to_idx = pickle.load(f)  # 原始映射: {service_name: node_id}
+    idx_to_service = {v: k for k, v in service_to_idx.items()}  # 反转后: {node_id: service_name}
+
+    # Get top-k service names
+    top_k_service_names = [idx_to_service[idx] for idx in top_k_result]
+
+    return top_k_service_names
 
 @app.command()
 def predict(
@@ -234,6 +318,9 @@ def predict(
         "data/RCABENCH/samples/abnormal_samples.pkl", help="Path to samples pickle file"
     ),
     model_path: str = typer.Option("best_rca_model.pth", help="Path to trained model"),
+    service_map_path: str = typer.Option(
+        "data/RCABENCH/service_to_idx.pkl", help="Path to service_to_idx.pkl mapping file" 
+    ),
     top_k: int = typer.Option(5, help="Number of top predictions to show"),
     device: Optional[str] = typer.Option(None, help="Device to use (cuda/cpu)"),
 ):
@@ -252,6 +339,14 @@ def predict(
     if not os.path.exists(samples_path):
         typer.echo(f"Error: Samples file not found: {samples_path}", err=True)
         raise typer.Exit(1)
+    if not os.path.exists(service_map_path):
+        typer.echo(f"Error: Service map file not found: {service_map_path}", err=True)
+        raise typer.Exit(1)
+    
+    # 加载服务名映射并反转（得到 {node_id: service_name}）
+    with open(service_map_path, "rb") as f:
+        service_to_idx = pickle.load(f)  # 原始映射: {service_name: node_id}
+    idx_to_service = {v: k for k, v in service_to_idx.items()}  # 反转后: {node_id: service_name}
 
     # Load metadata
     metadata_path = model_path.replace(".pth", "_metadata.pkl")
@@ -293,17 +388,119 @@ def predict(
     # Run prediction
     typer.echo(f"Predicting root cause for sample {sample_index}...")
     results = predict_single_case(model, features, graph, device_obj)
+    # 5. 转换
+    answers = []
+    for result in results[:top_k]:  # 取 top_k 结果
+        node_id = result["node_id"]
+        service_name = idx_to_service[node_id]  # 通过 node_id 映射服务名
+        answers.append({
+            "level": "service",  # 固定为 "service"
+            "name": service_name,  # 服务名（如 "mysql"、"rabbitmq"）
+            "rank": result["rank"]  # 保持原排名
+        })
+
 
     # Show Top-K results
     typer.echo(f"\nTop-{top_k} Root Cause Predictions:")
     typer.echo("-" * 50)
-    typer.echo(f"{'Rank':<6} {'Node ID':<10} {'Node Name':<15} {'Probability':<12}")
+    typer.echo(f"{'Rank':<10} {'Node ID':<10} {'Node Name':<15}")
     typer.echo("-" * 50)
 
-    for result in results[:top_k]:
+    for result in answers[:top_k]:
         typer.echo(
-            f"{result['rank']:<6} {result['node_id']:<10} {result['node_name']:<15} {result['probability']:<12.4f}"
+            f"{result['level']:<10} {result['rank']:<10} {result['name']:<10}"
         )
+
+@app.command()
+def incremental_train(
+    samples_path: str = typer.Option(
+        "data/RCABENCH/samples/abnormal_samples1.pkl",
+        help="Path to new samples pickle file for incremental training"
+    ),
+    labels_path: str = typer.Option(
+        "data/RCABENCH/samples/abnormal_labels1.pkl",
+        help="Path to new labels pickle file for incremental training"
+    ),
+    pretrained_model_path: str = typer.Option(
+        "best_rca_model.pth",
+        help="Path to pretrained model checkpoint"
+    ),
+    output_model: str = typer.Option(
+        "best_rca_model.pth",
+        help="Output path for the incrementally trained model (will overwrite if exists)"
+    ),
+    seed: int = typer.Option(42, help="Random seed for data splitting"),
+    epochs: int = typer.Option(20, help="Number of incremental training epochs"),
+    batch_size: int = typer.Option(32, help="Batch size for training"),
+    learning_rate: float = typer.Option(1e-3, 
+        help="Learning rate for incremental training (usually smaller than initial training)"),
+    hidden_dim: int = typer.Option(32, help="Hidden dimension (must match pretrained model)"),
+    use_transformer: bool = typer.Option(True, 
+        help="Use transformer architecture (must match pretrained model)"),
+    device: Optional[str] = typer.Option(None, help="Device to use (cuda/cpu)"),
+):
+    """Incrementally train the RCA model with new data"""
+    # Set device
+    if device is None:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device_str = device
+    device_obj = torch.device(device_str)
+    typer.echo(f"Using device: {device_obj}")
+
+    # Check files
+    if not os.path.exists(samples_path):
+        typer.echo(f"Error: Samples file not found: {samples_path}", err=True)
+        raise typer.Exit(1)
+    if not os.path.exists(labels_path):
+        typer.echo(f"Error: Labels file not found: {labels_path}", err=True)
+        raise typer.Exit(1)
+    if not os.path.exists(pretrained_model_path):
+        typer.echo(f"Error: Pretrained model not found: {pretrained_model_path}", err=True)
+        raise typer.Exit(1)
+
+    # Load dataset
+    typer.echo("Loading new dataset for incremental training...")
+    with open(samples_path, "rb") as f:
+        samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(labels_path, "rb") as f:
+        labels = pickle.load(f)  # list of tensors (length = num_nodes)
+    full_dataset = RCADataset(samples, labels)
+
+    # Get model parameters
+    num_nodes = full_dataset.num_nodes
+    feature_dim = full_dataset.samples[0][0].shape[-1]
+    typer.echo(
+        f"Dataset loaded: {len(full_dataset)} samples, {num_nodes} nodes, {feature_dim} features"
+    )
+
+    # Create data loaders
+    train_loader, val_loader, _ = prepare_data_loaders(
+        full_dataset, batch_size=batch_size, seed=seed
+    )
+
+    # Initialize model (must match pretrained model architecture)
+    model = RCAModel(
+        num_services=num_nodes,
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        use_transformer=use_transformer,
+    ).to(device_obj)
+
+    # Perform incremental training
+    typer.echo("Starting incremental training...")
+    model = incremental_train_model(
+        model,
+        train_loader,
+        val_loader,
+        device_obj,
+        num_epochs=epochs,
+        lr=learning_rate,
+        pretrained_model_path=pretrained_model_path,
+        output_model_path=output_model,
+    )
+
+    typer.echo(f"Incremental training completed! Model saved to {output_model}")
 
 
 if __name__ == "__main__":

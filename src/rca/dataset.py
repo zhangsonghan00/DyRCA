@@ -7,13 +7,9 @@ import dgl
 class RCADataset(Dataset):
     """Root Cause Analysis dataset class, handling graph data and temporal features"""
 
-    def __init__(self, samples_path, labels_path):
-        # Load data
-        with open(samples_path, "rb") as f:
-            self.samples = pickle.load(f)  # list of (features, graph) tuples
-        with open(labels_path, "rb") as f:
-            self.labels = pickle.load(f)  # list of tensors (length = num_nodes)
-
+    def __init__(self, samples, labels):
+        self.samples = samples
+        self.labels = labels
         # Check if data lengths match
         assert len(self.samples) == len(self.labels), (
             "Number of samples and labels do not match"

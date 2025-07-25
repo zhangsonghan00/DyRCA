@@ -7,6 +7,7 @@ import numpy as np
 import pickle
 import os
 from typing import Optional
+import typer
 
 
 def train_model(model, train_loader, val_loader, device, num_epochs=50, lr=1e-3):
@@ -69,22 +70,22 @@ def train_model(model, train_loader, val_loader, device, num_epochs=50, lr=1e-3)
         scheduler.step()
 
         # Print training info
-        print(f"Epoch {epoch + 1}/{num_epochs}")
-        print(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-        print(f"Current LR: {optimizer.param_groups[0]['lr']:.8f}")
+        typer.echo(f"Epoch {epoch + 1}/{num_epochs}")
+        typer.echo(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        typer.echo(f"Current LR: {optimizer.param_groups[0]['lr']:.8f}")
 
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), best_model_path)
-            print(f"Saved best model (Val Loss: {best_val_loss:.6f})")
+            typer.echo(f"Saved best model (Val Loss: {best_val_loss:.6f})")
 
         # Print test details every 2 epochs
         if (epoch + 1) % 2 == 0:
-            print("-" * 50)
-            test_results = test_model(model, val_loader, device)
+            typer.echo("-" * 50)
+            test_results,_ = test_model(model, val_loader, device)
             for metric, value in test_results.items():
-                print(f"{metric}: {value:.4f}")
+                typer.echo(f"{metric}: {value:.4f}")
 
     return model
 
@@ -113,6 +114,7 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
 
     # Calculate Top-K accuracy
     results = {}
+    top_k_results=[]
     for k in top_k_list:
         # Ensure k does not exceed number of nodes
         k = min(k, all_preds.shape[1])
@@ -130,12 +132,12 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
             # Check if true root cause is in Top-K
             if np.any(np.isin(true_root, top_k_pred)):
                 correct += 1
-
+            if k == 5:
+                top_k_results.append(top_k_pred)
         accuracy = correct / len(all_preds)
         results[f"Top-{k} Accuracy"] = accuracy
-        print(f"Top-{k} Accuracy: {accuracy:.4f}")
-
-    return results
+    print(f"Test Results: {results}")
+    return results, top_k_results
 
 
 def predict_single_case(model, features, graph, device, node_names=None):
@@ -185,18 +187,31 @@ def load_model_and_metadata(model_path: str, metadata_path: Optional[str] = None
 
     return metadata
 
-
-def prepare_data_loaders(dataset, batch_size=32, train_ratio=0.6, val_ratio=0.2):
-    """Prepare train, validation, and test data loaders"""
+def prepare_data_loaders(dataset, batch_size=32, train_ratio=0.7, val_ratio=0.3, seed=42):
+    """Prepare train, validation, and test data loaders with a fixed random seed"""
     from .dataset import collate_fn
+    import torch
 
-    # Split train, validation, and test sets
-    train_size = int(train_ratio * len(dataset))
-    val_size = int(val_ratio * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size]
-    )
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    
+    # # Split train, validation, and test sets
+    # train_size = int(train_ratio * len(dataset))
+    # val_size = int(val_ratio * len(dataset))
+    # test_size = len(dataset) - train_size - val_size
+    # train_dataset, val_dataset, test_dataset = random_split(
+    #     dataset, [train_size, val_size, test_size]
+    # )
+    from torch.utils.data import Subset
+
+    # 按顺序分割数据集（假设 dataset 是 RCADataset 实例）
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.3 * len(dataset))
+
+    # 创建连续索引的子集
+    train_dataset = Subset(dataset, indices=range(0, train_size))
+    val_dataset = Subset(dataset, indices=range(train_size, train_size + val_size))
+    test_dataset = Subset(dataset, indices=range(train_size + val_size, len(dataset)))
 
     # Create data loaders
     train_loader = DataLoader(
