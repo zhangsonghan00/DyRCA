@@ -29,7 +29,7 @@ app = typer.Typer(help="PaDi-RCA: Root Cause Analysis Command Line Tool")
 @app.command()
 def preprocess(
     data_root: str = typer.Option(
-        "/mnt/jfs/rcabench-platform-v2/data/rcabench_filtered",
+        "/mnt/jfs/rcabench-platform-v2/data",
         help="Root directory containing case data",
     ),
     output_dir: str = typer.Option(
@@ -39,7 +39,7 @@ def preprocess(
         None, help="Maximum number of cases to process"
     ),
     dataset_type: str = typer.Option(
-        "rcabench_filtered", help="Dataset type: rcabench, rcabench_filtered, or other"
+        "RCABENCH_r1", help="Dataset type: RCABENCH_r1, RCABENCH_filtered, or other"
     ),
 ):
     """Run data preprocessing"""
@@ -59,12 +59,9 @@ def preprocess(
         )
 
         typer.echo("\nPreprocessing completed successfully!")
-        typer.echo(f"Processed {result['num_samples']} samples")
         typer.echo(
             f"Found {result['num_services']} services and {result['num_metrics']} metrics"
         )
-        typer.echo(f"Samples saved to: {result['samples_path']}")
-        typer.echo(f"Labels saved to: {result['labels_path']}")
 
     except Exception as e:
         typer.echo(f"Error during preprocessing: {e}", err=True)
@@ -73,11 +70,17 @@ def preprocess(
 
 @app.command()
 def train(
-    samples_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_samples1.pkl", help="Path to samples pickle file"
+    train_samples_path: str = typer.Option(
+        "data/RCABENCH/samples/train_samples.pkl", help="Path to samples pickle file"
     ),
-    labels_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_labels1.pkl", help="Path to labels pickle file"
+    train_labels_path: str = typer.Option(
+        "data/RCABENCH/samples/train_labels.pkl", help="Path to labels pickle file"
+    ),
+    test_samples_path: str = typer.Option(
+        "data/RCABENCH/samples/test_samples.pkl", help="Path to samples pickle file"
+    ),
+    test_labels_path: str = typer.Option(
+        "data/RCABENCH/samples/test_labels.pkl", help="Path to labels pickle file"
     ),
     seed: int = typer.Option(42, help="Random seed for data splitting"),
     output_model: str = typer.Option("best_rca_model.pth", help="Output model path"),
@@ -98,32 +101,77 @@ def train(
     typer.echo(f"Using device: {device_obj}")
 
     # Check if data files exist
-    if not os.path.exists(samples_path):
-        typer.echo(f"Error: Samples file not found: {samples_path}", err=True)
+    if not os.path.exists(train_samples_path):
+        typer.echo(f"Error: Samples file not found: {train_samples_path}", err=True)
         raise typer.Exit(1)
-    if not os.path.exists(labels_path):
-        typer.echo(f"Error: Labels file not found: {labels_path}", err=True)
+    if not os.path.exists(train_labels_path):
+        typer.echo(f"Error: Labels file not found: {train_labels_path}", err=True)
         raise typer.Exit(1)
-
+    if not os.path.exists(test_samples_path):
+        typer.echo(f"Error: Samples file not found: {test_samples_path}", err=True)
+        raise typer.Exit(1)
+    if not os.path.exists(test_labels_path):
+        typer.echo(f"Error: Labels file not found: {test_labels_path}", err=True)
+        raise typer.Exit(1)
+    
     # Load dataset
     typer.echo("Loading dataset...")
         # Load data
-    with open(samples_path, "rb") as f:
-        samples = pickle.load(f)  # list of (features, graph) tuples
-    with open(labels_path, "rb") as f:
-        labels = pickle.load(f)  # list of tensors (length = num_nodes)
-    full_dataset = RCADataset(samples, labels)
+    with open(train_samples_path, "rb") as f:
+        train_samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(train_labels_path, "rb") as f:
+        train_labels = pickle.load(f)  # list of tensors (length = num_nodes)
+    with open(test_samples_path, "rb") as f:
+        test_samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(test_labels_path, "rb") as f:
+        test_labels = pickle.load(f)  # list of tensors (length = num_nodes)
 
-    num_nodes = full_dataset.num_nodes
-    feature_dim = full_dataset.samples[0][0].shape[-1]
+    ###让label type一致
+    def filter_samples_by_labels(train_labels, train_samples, test_labels):
+        # 1. 统计测试集中出现的非零类别
+        test_labels_tensor = torch.stack(test_labels)
+        test_classes = set(torch.where(test_labels_tensor.sum(dim=0) > 0)[0].tolist())
+        
+        # 2. 筛选训练集中的样本
+        filtered_train_labels = []
+        filtered_train_samples = []
+        
+        for label, sample in zip(train_labels, train_samples):
+            # 获取当前标签的类别索引（假设是one-hot编码）
+            class_idx = torch.argmax(label).item()
+            
+            # 保留测试集中存在的类别样本
+            if class_idx in test_classes:
+                filtered_train_labels.append(label)
+                filtered_train_samples.append(sample)
+        
+        return filtered_train_labels, filtered_train_samples
+
+    train_labels, train_samples = filter_samples_by_labels(
+        train_labels, train_samples, test_labels
+    )
+
+    # 验证过滤后的训练集类别是否都在测试集中
+    train_classes = set(torch.argmax(torch.stack(train_labels), dim=1).tolist())
+    test_classes = set(torch.argmax(torch.stack(test_labels), dim=1).tolist())
+
+    print("过滤后的训练集类别:", train_classes)
+    print("测试集类别:", test_classes)
+    print("训练集类别是否都在测试集中:", train_classes.issubset(test_classes))
+
+    train_dataset = RCADataset(train_samples, train_labels)
+    test_dataset = RCADataset(test_samples, test_labels)
+
+    num_nodes = train_dataset.num_nodes
+    feature_dim = train_dataset.samples[0][0].shape[-1]
 
     typer.echo(
-        f"Dataset loaded: {len(full_dataset)} samples, {num_nodes} nodes, {feature_dim} features"
+        f"Train Dataset loaded: {len(train_dataset)} samples, {num_nodes} nodes, {feature_dim} features"
     )
 
     # Create data loaders
     train_loader, val_loader, test_loader = prepare_data_loaders(
-        full_dataset, batch_size=batch_size,seed=seed
+        train_dataset, test_dataset, batch_size=batch_size, seed=seed
     )
 
     # Initialize model
@@ -141,7 +189,7 @@ def train(
     # Train model
     typer.echo("Starting training...")
     train_model(
-        model, train_loader, val_loader, device_obj, num_epochs=epochs, lr=learning_rate
+        model, output_model, train_loader, test_loader, device_obj, num_epochs=epochs, lr=learning_rate
     )
 
     # Save model metadata
@@ -162,10 +210,10 @@ def train(
 @app.command()
 def test(
     samples_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_samples1.pkl", help="Path to samples pickle file"
+        "data/RCABENCH/samples/test_samples.pkl", help="Path to samples pickle file"
     ),
     labels_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_labels1.pkl", help="Path to labels pickle file"
+        "data/RCABENCH/samples/test_labels.pkl", help="Path to labels pickle file"
     ),
     seed: int = typer.Option(42, help="Random seed for data splitting"),
     model_path: str = typer.Option("best_rca_model.pth", help="Path to trained model"),
@@ -203,17 +251,17 @@ def test(
         samples = pickle.load(f)  # list of (features, graph) tuples
     with open(labels_path, "rb") as f:
         labels = pickle.load(f)  # list of tensors (length = num_nodes)
-    full_dataset = RCADataset(samples, labels)
+    test_dataset = RCADataset(samples, labels)
 
     # Get model parameters from metadata or dataset
-    num_nodes = metadata.get("num_nodes", full_dataset.num_nodes)
-    feature_dim = metadata.get("feature_dim", full_dataset.samples[0][0].shape[-1])
+    num_nodes = metadata.get("num_nodes", test_dataset.num_nodes)
+    feature_dim = metadata.get("feature_dim", test_dataset.samples[0][0].shape[-1])
     hidden_dim = metadata.get("hidden_dim", 32)
     use_transformer = metadata.get("use_transformer", True)
 
     # Create test data loader
     _, _, test_loader = prepare_data_loaders(
-        full_dataset, batch_size=batch_size, seed=seed
+        test_dataset, test_dataset, batch_size=batch_size, seed=seed
     )
 
     # Initialize and load model

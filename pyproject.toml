@@ -19,7 +19,7 @@ dependencies = [
     "loguru>=0.7.3",
     "rcabench>=1.0.19",
     "typer>=0.16.0",
-    "rcabench-platform>=0.2.7",
+    "rcabench-platform>=0.3.3",
     "polars-lts-cpu>=1.31.0",
 ]
 [tool.uv.sources]

@@ -108,18 +108,6 @@ class FaultPropagationGAT(nn.Module):
     def forward(self, g: dgl.DGLGraph, node_features: torch.Tensor) -> torch.Tensor:
         edge_weights = g.edata["weight"]  # Edge weights shape: [num_edges]
 
-        # # Manually implement message passing with edge weights (replace default GAT message function)
-        # def message_func(edges):
-        #     # edges.src['h']: [num_edges, hidden_dim*num_heads]
-        #     # edges.data['weight']: [num_edges] → expand to [num_edges, 1]
-        #     return {'msg': edges.src['h'] * edges.data['weight'].unsqueeze(1)}
-
-        # # Fix aggregation function: explicitly aggregate along neighbor dimension
-        # def reduce_func(nodes):
-        #     # nodes.mailbox['msg']: [num_nodes, num_neighbors, hidden_dim*num_heads]
-        #     # Only average along neighbor dimension (dim=1), output shape: [num_nodes, hidden_dim*num_heads]
-        #     return {'h': torch.mean(nodes.mailbox['msg'], dim=1)}
-
         # First GAT layer: multi-head feature extraction
         h1 = self.gat1(g, node_features)  # Shape: [num_nodes, num_heads, hidden_dim]
 
@@ -147,8 +135,6 @@ class FaultPropagationGAT(nn.Module):
         h2 = self.gat2(g, h1_weighted)  # Shape: [num_nodes, 1, hidden_dim]
         h2 = h2.squeeze(1)  # Remove single-head dimension → [num_nodes, hidden_dim]
 
-        # # 3. Combine original features and propagated features (residual connection, retain self information)
-        # final_features = node_features + h2  # [num_nodes, hidden_dim]
         return h2
 
 

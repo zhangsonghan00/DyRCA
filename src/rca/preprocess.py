@@ -21,27 +21,32 @@ from enum import Enum, auto  # Import Enum base class and auto value generator
 class Dataset(Enum):  # Define an Enum class named Dataset, inheriting from Enum
     RCABENCH_database = auto()
     RCABENCH_filtered = auto()
-    OTHER = auto()
+    RCABENCH_r1 = auto()
+    RCABENCH_r2 = auto()
 
 
 # Configuration parameters
 SAMPLING_SIZE = 5  # Data smoothing granularity: 5 seconds
-WINDOW_SIZE = 10  # Sliding window size: 10 sampling points
-SLIDING_STEP = 1  # Sliding step size
+WINDOW_SIZE = 20  # Sliding window size: 10 sampling points
+SLIDING_STEP = 5  # Sliding step size
+    
 
+from typing import Union
 
 def create_dataset(
     data_root: str,
     output_dir: str,
     max_cases: Optional[int] = None,
-    ds: str = "rcabench",
-) -> List[Path]:
+    ds: str = "RCABENCH_r1",
+) -> Union[List[Path], Tuple[List[Path], List[Path]]]:
     if ds == "rcabench":
         dataset = Dataset.RCABENCH_database
     elif ds == "rcabench_filtered":
         dataset = Dataset.RCABENCH_filtered
-    elif ds == "other":
-        dataset = Dataset.OTHER
+    elif ds == "RCABENCH_r1":
+        dataset = Dataset.RCABENCH_r1
+    elif ds == "RCABENCH_r2":
+        dataset = Dataset.RCABENCH_r2
 
     logger.info("Starting dataset creation...")
     output_path = Path(output_dir) / ds
@@ -63,23 +68,6 @@ def create_dataset(
 
     elif dataset == Dataset.RCABENCH_filtered:
         logger.info(f"Using filtered dataset from {data_root}")
-        service_select = [
-            "preserve-service",
-            "security-service",
-            "order-service",
-            "consign-service",
-            "consign-price-service",
-            "food-service",
-            "station-food-service",
-            "train-food-service",
-            "assurance-service",
-            "preserve-other-service",
-            "order-other-service",
-            "contact-service",
-            "station-service",
-            "seat-service",
-        ]
-
         service_path_name = []
 
         # Traverse directory
@@ -92,6 +80,31 @@ def create_dataset(
         data_packs = [Path(data_root) / name for name in service_path_name]
 
         data_packs = data_packs[:max_cases]
+
+    elif dataset == Dataset.RCABENCH_r1 or dataset == Dataset.RCABENCH_r2:
+        logger.info(f"Using {ds} dataset from {data_root}")
+        # Use RCABENCH_r1 or RCABENCH_r2 dataset
+        if dataset == Dataset.RCABENCH_r1:
+            train_dir = Path(data_root) / "__dev__rcabench_train_r1"
+            test_dir = Path(data_root) / "__dev__rcabench_test_r1"
+        else:
+            train_dir = Path(data_root) / "__dev__rcabench_train_r2"
+            test_dir = Path(data_root) / "__dev__rcabench_test_r2"
+
+        if not train_dir.exists() or not test_dir.exists():
+            raise FileNotFoundError("Train or test directory does not exist")
+
+        train_cases = os.listdir(train_dir)
+        test_cases = os.listdir(test_dir)
+
+        train_data_packs = [train_dir / case for case in train_cases]
+        test_data_packs = [test_dir / case for case in test_cases]
+
+        if max_cases is not None:
+            train_data_packs = train_data_packs[:max_cases]
+            test_data_packs = test_data_packs[:max_cases]
+        
+        return train_data_packs, test_data_packs
 
     return data_packs
 
@@ -704,116 +717,20 @@ def create_dataset_for_training(
 
 def main():
     output_dir = "data/RCABENCH"
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "samples"), exist_ok=True)
-
-    # Get data pack paths
-    data_packs = create_dataset(
-        data_root="/mnt/jfs/rcabench-platform-v2/data/rcabench_filtered",
-        output_dir="data",
+    
+    # Use RCABENCH_r1 dataset which returns train/test splits
+    result = run_preprocessing(
+        data_root="/mnt/jfs/rcabench-platform-v2/data",  # Adjust path as needed
+        output_dir=output_dir,
         max_cases=30,
-        ds="rcabench_filtered",
+        ds="RCABENCH_r1",  # Use the train/test split dataset
     )
-    typer.echo(f"Found {len(data_packs)} data packs")
-
-    # Collect all services and metrics
-    all_services, all_metrics = collect_all_services_and_metrics(
-        data_packs, "abnormal_metrics.parquet"
-    )
-    typer.echo(f"Found {len(all_services)} services: {all_services}")
-    typer.echo(f"Found {len(all_metrics)} metrics: {all_metrics}")
-
-    # Save global service_to_idx and metric_to_idx
-    service_to_idx = {service: i for i, service in enumerate(all_services)}
-    metric_to_idx = {metric: i for i, metric in enumerate(all_metrics)}
-    with open(os.path.join(output_dir, "service_to_idx.pkl"), "wb") as f:
-        pickle.dump(service_to_idx, f)
-    with open(os.path.join(output_dir, "metric_to_idx.pkl"), "wb") as f:
-        pickle.dump(metric_to_idx, f)
-
-    # Process abnormal data
-    abnormal_case_data = []
-    abnormal_labels_by_case = []
-
-    logger.info("Processing abnormal data...")
-    for case_dir in tqdm(data_packs, desc="Processing abnormal cases"):
-        try:
-            timestamps, features, edges = process_case(
-                case_dir,
-                "abnormal_metrics.parquet",
-                "abnormal_traces.parquet",
-                "abnormal_logs.parquet",
-                all_services,
-                all_metrics,
-            )
-            if timestamps:
-                abnormal_case_data.append((timestamps, features, edges))
-                labels = create_labels_for_case(case_dir, timestamps, all_services)
-                abnormal_labels_by_case.append(labels)
-        except Exception as e:
-            logger.warning(f"Error processing case {case_dir}: {e}")
-            continue
-    # Normalize features
-    logger.info("Normalizing features...")
-    all_features = []
-    for _, features, _ in abnormal_case_data:
-        all_features.extend(features)
-
-    if all_features:
-        normalized_features = minmax_normalize_features(all_features)
-
-        # Replace original features
-        idx = 0
-        for i, (timestamps, _, edges) in enumerate(abnormal_case_data):
-            num_windows = len(timestamps)
-            abnormal_case_data[i] = (
-                timestamps,
-                normalized_features[idx : idx + num_windows],
-                edges,
-            )
-            idx += num_windows
-
-    # Create sliding window samples
-    logger.info("Creating sliding window samples...")
-    abnormal_samples = create_dataset_for_training(
-        abnormal_case_data, all_services, window_size=WINDOW_SIZE, max_gap=15
-    )
-
-    # Create corresponding labels
-    abnormal_sample_labels = []
-    sample_idx = 0
-    for case_labels in abnormal_labels_by_case:
-        if len(case_labels) >= WINDOW_SIZE:
-            for i in range(len(case_labels) - WINDOW_SIZE + 1):
-                # Use the label of the last time as the sample label
-                abnormal_sample_labels.append(case_labels[i + WINDOW_SIZE - 1])
-                sample_idx += 1
-
-    # Save data
-    logger.info(f"Saving {len(abnormal_samples)} abnormal samples...")
-    with open(
-        os.path.join(output_dir, "samples", "abnormal_samples.pkl"), "wb"
-    ) as f:
-        pickle.dump(abnormal_samples, f)
-
-    with open(
-        os.path.join(output_dir, "samples", "abnormal_labels.pkl"), "wb"
-    ) as f:
-        pickle.dump(abnormal_sample_labels, f)
-
-    logger.info("Data preprocessing completed!")
-
-    # Output statistics
-    if abnormal_samples:
-        typer.echo(f"{len(abnormal_samples)} abnormal samples")
-        sample_features, sample_graph = abnormal_samples[0]
-        typer.echo(f"Sample feature shape: {sample_features.shape}")
-        typer.echo(f"Graph node count: {sample_graph.num_nodes()}")
-        typer.echo(f"Graph edge count: {sample_graph.num_edges()}")
-        typer.echo(
-            f"Label shape: {abnormal_sample_labels[0].shape if abnormal_sample_labels else 'N/A'}"
-        )
-        typer.echo(abnormal_sample_labels[0])
+    
+    typer.echo("Preprocessing completed!")
+    typer.echo(f"Train samples: {result['num_train_samples']}")
+    typer.echo(f"Test samples: {result['num_test_samples']}")
+    typer.echo(f"Total services: {result['num_services']}")
+    typer.echo(f"Total metrics: {result['num_metrics']}")
 
 
 def run_preprocessing(
@@ -822,127 +739,160 @@ def run_preprocessing(
     max_cases: Optional[int] = None,
     ds: str = "rcabench",
 ):
-    """Main function to run data preprocessing"""
+    """Main function to run data preprocessing for both train and test sets"""
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "samples"), exist_ok=True)
 
-    # Get data pack paths
-    data_packs = create_dataset(
+    # Get data pack paths - now returns train and test separately
+    dataset_result = create_dataset(
         data_root=data_root, output_dir="data", max_cases=max_cases, ds=ds
     )
-    typer.echo(f"Found {len(data_packs)} data packs")
+    
+    # Handle different return types based on dataset
+    if isinstance(dataset_result, tuple):
+        train_data_packs, test_data_packs = dataset_result
+        typer.echo(f"Found {len(train_data_packs)} train data packs")
+        typer.echo(f"Found {len(test_data_packs)} test data packs")
+        all_data_packs = train_data_packs + test_data_packs
+    else:
+        # For backward compatibility with single dataset
+        all_data_packs = dataset_result
+        train_data_packs = all_data_packs
+        test_data_packs = []
+        typer.echo(f"Found {len(all_data_packs)} data packs (single dataset)")
 
-    # Collect all services and metrics
+    # Collect all services and metrics from both train and test
     all_services, all_metrics = collect_all_services_and_metrics(
-        data_packs, "abnormal_metrics.parquet"
+        all_data_packs, "abnormal_metrics.parquet"
     )
     typer.echo(f"Found {len(all_services)} services: {all_services}")
     typer.echo(f"Found {len(all_metrics)} metrics: {all_metrics}")
 
-    # Save global service_to_idx and metric_to_idx
+    # Save global service_to_idx and metric_to_idx (unified for train and test)
     service_to_idx = {service: i for i, service in enumerate(all_services)}
     metric_to_idx = {metric: i for i, metric in enumerate(all_metrics)}
-    with open(os.path.join(output_dir, "service_to_idx1.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "service_to_idx_r2.pkl"), "wb") as f:
         pickle.dump(service_to_idx, f)
-    with open(os.path.join(output_dir, "metric_to_idx1.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "metric_to_idx_r2.pkl"), "wb") as f:
         pickle.dump(metric_to_idx, f)
 
-    # Process abnormal data
-    abnormal_case_data = []
-    abnormal_labels_by_case = []
+    def process_data_packs(data_packs, data_type="train"):
+        """Process a list of data packs and return samples and labels"""
+        case_data = []
+        labels_by_case = []
 
-    logger.info("Processing abnormal data...")
-    for case_dir in tqdm(data_packs, desc="Processing abnormal cases"):
-        try:
-            timestamps, features, edges = process_case(
-                case_dir,
-                "abnormal_metrics.parquet",
-                "abnormal_traces.parquet",
-                "abnormal_logs.parquet",
-                all_services,
-                all_metrics,
-            )
-            if timestamps:
-                abnormal_case_data.append((timestamps, features, edges))
-                labels = create_labels_for_case(case_dir, timestamps, all_services)
-                abnormal_labels_by_case.append(labels)
-        except Exception as e:
-            logger.warning(f"Error processing case {case_dir}: {e}")
-            continue
+        logger.info(f"Processing {data_type} data...")
+        for case_dir in tqdm(data_packs, desc=f"Processing {data_type} cases"):
+            try:
+                timestamps, features, edges = process_case(
+                    case_dir,
+                    "abnormal_metrics.parquet",
+                    "abnormal_traces.parquet",
+                    "abnormal_logs.parquet",
+                    all_services,
+                    all_metrics,
+                )
+                if timestamps:
+                    case_data.append((timestamps, features, edges))
+                    labels = create_labels_for_case(case_dir, timestamps, all_services)
+                    labels_by_case.append(labels)
+            except Exception as e:
+                logger.warning(f"Error processing case {case_dir}: {e}")
+                continue
 
-    # Normalize features
-    logger.info("Normalizing features...")
-    all_features = []
-    for _, features, _ in abnormal_case_data:
-        all_features.extend(features)
+        # Normalize features
+        logger.info(f"Normalizing {data_type} features...")
+        all_features = []
+        for _, features, _ in case_data:
+            all_features.extend(features)
 
-    if all_features:
-        normalized_features = minmax_normalize_features(all_features)
+        if all_features:
+            normalized_features = minmax_normalize_features(all_features)
 
-        # Replace original features
-        idx = 0
-        for i, (timestamps, _, edges) in enumerate(abnormal_case_data):
-            num_windows = len(timestamps)
-            abnormal_case_data[i] = (
-                timestamps,
-                normalized_features[idx : idx + num_windows],
-                edges,
-            )
-            idx += num_windows
+            # Replace original features
+            idx = 0
+            for i, (timestamps, _, edges) in enumerate(case_data):
+                num_windows = len(timestamps)
+                case_data[i] = (
+                    timestamps,
+                    normalized_features[idx : idx + num_windows],
+                    edges,
+                )
+                idx += num_windows
 
-    # Create sliding window samples
-    logger.info("Creating sliding window samples...")
-    abnormal_samples = create_dataset_for_training(
-        abnormal_case_data, all_services, window_size=WINDOW_SIZE, max_gap=15
-    )
+        # Create sliding window samples
+        logger.info(f"Creating {data_type} sliding window samples...")
+        samples = create_dataset_for_training(
+            case_data, all_services, window_size=WINDOW_SIZE, max_gap=15
+        )
 
-    # Create corresponding labels
-    abnormal_sample_labels = []
-    sample_idx = 0
-    for case_labels in abnormal_labels_by_case:
-        if len(case_labels) >= WINDOW_SIZE:
-            for i in range(0, len(case_labels) - WINDOW_SIZE + 1, SLIDING_STEP):
-                # Use the label of the last time as the sample label
-                abnormal_sample_labels.append(case_labels[i + WINDOW_SIZE - 1])
-                sample_idx += 1
+        # Create corresponding labels
+        sample_labels = []
+        for case_labels in labels_by_case:
+            if len(case_labels) >= WINDOW_SIZE:
+                for i in range(0, len(case_labels) - WINDOW_SIZE + 1, SLIDING_STEP):
+                    # Use the label of the last time as the sample label
+                    sample_labels.append(case_labels[i + WINDOW_SIZE - 1])
 
-    # Save data
-    logger.info(f"Saving {len(abnormal_samples)} abnormal samples...")
-    with open(
-        os.path.join(output_dir, "samples", "abnormal_samples1.pkl"), "wb"
-    ) as f:
-        pickle.dump(abnormal_samples, f)
+        return samples, sample_labels
 
-    with open(
-        os.path.join(output_dir, "samples", "abnormal_labels1.pkl"), "wb"
-    ) as f:
-        pickle.dump(abnormal_sample_labels, f)
+    # Process train data
+    if train_data_packs:
+        train_samples, train_labels = process_data_packs(train_data_packs, "train")
+        
+        # Save train data
+        logger.info(f"Saving {len(train_samples)} train samples...")
+        with open(os.path.join(output_dir, "samples", "train_samples_r2.pkl"), "wb") as f:
+            pickle.dump(train_samples, f)
+        with open(os.path.join(output_dir, "samples", "train_labels_r2.pkl"), "wb") as f:
+            pickle.dump(train_labels, f)
+
+        # Output train statistics
+        if train_samples:
+            typer.echo(f"Train: {len(train_samples)} samples")
+            sample_features, sample_graph = train_samples[0]
+            typer.echo(f"Train sample feature shape: {sample_features.shape}")
+            typer.echo(f"Train graph node count: {sample_graph.num_nodes()}")
+            typer.echo(f"Train graph edge count: {sample_graph.num_edges()}")
+            typer.echo(f"Train label shape: {train_labels[0].shape if train_labels else 'N/A'}")
+    else:
+        train_samples, train_labels = [], []
+
+    # Process test data
+    if test_data_packs:
+        test_samples, test_labels = process_data_packs(test_data_packs, "test")
+        
+        # Save test data
+        logger.info(f"Saving {len(test_samples)} test samples...")
+        with open(os.path.join(output_dir, "samples", "test_samples_r2.pkl"), "wb") as f:
+            pickle.dump(test_samples, f)
+        with open(os.path.join(output_dir, "samples", "test_labels_r2.pkl"), "wb") as f:
+            pickle.dump(test_labels, f)
+
+        # Output test statistics
+        if test_samples:
+            typer.echo(f"Test: {len(test_samples)} samples")
+            sample_features, sample_graph = test_samples[0]
+            typer.echo(f"Test sample feature shape: {sample_features.shape}")
+            typer.echo(f"Test graph node count: {sample_graph.num_nodes()}")
+            typer.echo(f"Test graph edge count: {sample_graph.num_edges()}")
+            typer.echo(f"Test label shape: {test_labels[0].shape if test_labels else 'N/A'}")
+    else:
+        test_samples, test_labels = [], []
 
     logger.info("Data preprocessing completed!")
 
-    # Output statistics
-    if abnormal_samples:
-        typer.echo(f"{len(abnormal_samples)} abnormal samples")
-        sample_features, sample_graph = abnormal_samples[0]
-        typer.echo(f"Sample feature shape: {sample_features.shape}")
-        typer.echo(f"Graph node count: {sample_graph.num_nodes()}")
-        typer.echo(f"Graph edge count: {sample_graph.num_edges()}")
-        typer.echo(
-            f"Label shape: {abnormal_sample_labels[0].shape if abnormal_sample_labels else 'N/A'}"
-        )
-        typer.echo(abnormal_sample_labels[0])
-
     return {
-        "num_samples": len(abnormal_samples),
+        "num_train_samples": len(train_samples),
+        "num_test_samples": len(test_samples),
         "num_services": len(all_services),
         "num_metrics": len(all_metrics),
-        "samples_path": os.path.join(
-            output_dir, "samples", "abnormal_samples.pkl"
-        ),
-        "labels_path": os.path.join(
-            output_dir, "samples", "abnormal_labels.pkl"
-        ),
+        "train_samples_path": os.path.join(output_dir, "samples", "train_samples.pkl") if train_data_packs else None,
+        "train_labels_path": os.path.join(output_dir, "samples", "train_labels.pkl") if train_data_packs else None,
+        "test_samples_path": os.path.join(output_dir, "samples", "test_samples.pkl") if test_data_packs else None,
+        "test_labels_path": os.path.join(output_dir, "samples", "test_labels.pkl") if test_data_packs else None,
     }
+
 
 def run_single_pack_preprocessing(
         datapack_path: Path,
