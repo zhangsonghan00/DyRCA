@@ -27,7 +27,7 @@ class Dataset(Enum):  # Define an Enum class named Dataset, inheriting from Enum
 
 # Configuration parameters
 SAMPLING_SIZE = 5  # Data smoothing granularity: 5 seconds
-WINDOW_SIZE = 20  # Sliding window size: 10 sampling points
+WINDOW_SIZE = 10  # Sliding window size: 10 sampling points
 SLIDING_STEP = 5  # Sliding step size
     
 
@@ -941,7 +941,7 @@ def run_single_pack_preprocessing(
         labels = create_labels_for_case(datapack_path, timestamps, all_services)
         sample_labels = []
         if len(labels) >= window_size:
-            for i in range(len(labels) - window_size + 1):
+            for i in range(0, len(labels) - window_size + 1, SLIDING_STEP):
                 sample_labels.append(labels[i + window_size - 1])
 
         # save samples and labels
