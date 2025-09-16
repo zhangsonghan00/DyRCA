@@ -771,9 +771,9 @@ def run_preprocessing(
     # Save global service_to_idx and metric_to_idx (unified for train and test)
     service_to_idx = {service: i for i, service in enumerate(all_services)}
     metric_to_idx = {metric: i for i, metric in enumerate(all_metrics)}
-    with open(os.path.join(output_dir, "service_to_idx_r2.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "service_to_idx_v1.pkl"), "wb") as f:
         pickle.dump(service_to_idx, f)
-    with open(os.path.join(output_dir, "metric_to_idx_r2.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "metric_to_idx_v1.pkl"), "wb") as f:
         pickle.dump(metric_to_idx, f)
 
     def process_data_packs(data_packs, data_type="train"):

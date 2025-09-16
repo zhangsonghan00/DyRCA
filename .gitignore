@@ -1,3 +1,7 @@
 data
 __pycache__
 .venv
+best_rca_model.pth
+best_rca_model_r2.pth
+best_rca_model_metadata.pkl
+best_rca_model_r2_metadata.pkl

@@ -11,6 +11,49 @@ from typing import Optional
 import typer
 import dgl
 
+def bidirectional_pairwise_ranking_loss(logits, root_idx, graph, margin=0.1, max_depth=2):
+    """
+    logits: (N,), 每个节点的预测得分
+    root_idx: 根因节点的索引
+    graph: DGLGraph，单个调用图
+    margin: pairwise 的最小分数间隔
+    max_depth: 最大传播链长度
+    """
+    device = logits.device
+    loss = torch.tensor(0.0, device=device)
+    total_pairs = 0
+
+    visited = set()
+    frontier = {root_idx}
+    affected_nodes = set()
+
+    for _ in range(max_depth):
+        next_frontier = set()
+
+        for node in frontier:
+            down = graph.successors(node).tolist()
+            up = graph.predecessors(node).tolist()
+
+            for nei in down + up:
+                if nei not in visited:
+                    affected_nodes.add(nei)
+                    next_frontier.add(nei)
+
+        visited |= frontier
+        frontier = next_frontier
+
+    # 防止根因节点被当作负样本
+    affected_nodes.discard(root_idx)
+
+    for neg_idx in affected_nodes:
+        diff = margin - logits[root_idx] + logits[neg_idx]
+        loss += torch.relu(diff) 
+        total_pairs += 1
+
+    if total_pairs == 0:
+        return torch.tensor(0.0, device=device)
+    return loss / total_pairs
+
 
 def train_model(model, output_model, train_loader, val_loader, device, num_epochs=50, lr=1e-3):
     # criterion = nn.BCEWithLogitsLoss()  # With sigmoid, suitable for one-hot labels
@@ -43,6 +86,19 @@ def train_model(model, output_model, train_loader, val_loader, device, num_epoch
 
                 # Compute loss
                 loss = criterion(outputs, labels)
+
+                # add pairwise-ranking loss
+                batched_graphs = dgl.unbatch(graphs)
+                pairwise_losses = []
+                for i in range(len(batched_graphs)):
+                    g = batched_graphs[i]
+                    root = labels[i].item()
+                    logits = outputs[i]
+                    loss_r = bidirectional_pairwise_ranking_loss(logits, root, g, margin=0.1, max_depth=3)
+                    pairwise_losses.append(loss_r)
+                pairwise_loss = torch.stack(pairwise_losses).mean()
+
+                loss = loss + 0.5 * pairwise_loss
                 train_loss += loss.item() * features.size(0)
 
                 # Backward and optimize
@@ -84,12 +140,12 @@ def train_model(model, output_model, train_loader, val_loader, device, num_epoch
             best_val_loss = val_loss
             torch.save(model.state_dict(), best_model_path)
             typer.echo(f"Saved best model (Val Loss: {best_val_loss:.6f})")
-        else:
-            typer.echo(f"Early stopping triggered at epoch {epoch}")
-            break
+        # else:
+        #     typer.echo(f"Early stopping triggered at epoch {epoch}")
+        #     break
 
         # Print test details every 2 epochs
-        if (epoch + 1) % 2 == 0:
+        if (epoch + 1) % 1 == 0:
             typer.echo("-" * 50)
             test_results,_ = test_model(model, val_loader, device)
             for metric, value in test_results.items():
@@ -217,26 +273,8 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
 
                     # baseline
                     hit_raw = (true_root in top_k_nodes)
-                    hit1= (true_root == top_k_nodes[0])
-                    # hit_rerank = (true_root in top_k_nodes[0:1])
-
-                    # if not hit_rerank:
-                    #     # rerank
-                    reranked = rerank_nodes_with_coverage_inbound(top_k_nodes, pred, g, alpha)
-
-                    top1_after_rerank = reranked[0]
-                    hit_rerank = (top1_after_rerank == true_root)
-
-                    # if not hit1 and hit_rerank:
-                    #     print(f"Hit! True root: {true_root}")
-                    #     print(f"Top-{k} nodes before rerank: {top_k_nodes}")
-                    #     print(f"Top-{k} nodes after rerank: {reranked}")
-                    #     print(pred_batch[i])
-
-
                     all_rerank_results.append({
-                        f"Top-{k} Accuracy (Raw)": hit_raw,
-                        f"Top-{k} Accuracy (Re-rank)": hit_rerank
+                        f"Top-{k} Accuracy": hit_raw,
                     })
 
                     # 收集所有 k 值的 top_k_nodes，而不仅是 k=5
@@ -253,10 +291,8 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
             print(f"警告: 没有找到 Top-{k} 的结果")
             continue
             
-        raw_acc = np.mean([res[f"Top-{k} Accuracy (Raw)"] for res in k_specific_results])
-        rerank_acc = np.mean([res[f"Top-{k} Accuracy (Re-rank)"] for res in k_specific_results])
-        results[f"Top-{k} Accuracy (Raw)"] = raw_acc
-        results[f"Top-1 Accuracy (Re-rank)"] = rerank_acc
+        raw_acc = np.mean([res[f"Top-{k} Accuracy"] for res in k_specific_results])
+        results[f"Top-{k} Accuracy"] = raw_acc
 
     # print("=== RCA Top-K Accuracy with Soft Re-ranking (Inbound) ===")
     # for k, v in results.items():
