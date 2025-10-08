@@ -1,7 +1,11 @@
-data
 __pycache__
-.venv
-best_rca_model.pth
-best_rca_model_r2.pth
-best_rca_model_metadata.pkl
-best_rca_model_r2_metadata.pkl
+.venv/
+data/
+study/
+info.toml
+entrypoint.sh
+analysis.py 
+main.py
+best_model_v1.pth
+best_model_v1_metadata.pkl
+uv.lock

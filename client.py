@@ -14,16 +14,18 @@ from src.rca.training import (
 from src.rca.dataset import collate_fn
 from src.rca.incremental_training import incremental_train_model
 from src.rca.preprocess import run_preprocessing, run_single_pack_preprocessing
+from src.rca.rcaeval_preprocess import run_preprocessing_rcaeval
+from src.rca.eadro_preprocess import run_preprocessing_eadro
 from torch.utils.data import DataLoader
 import pickle
 import warnings
 from pathlib import Path
 
-# 过滤特定的 PyTorch 警告
+ # Filter specific PyTorch warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-app = typer.Typer(help="PaDi-RCA: Root Cause Analysis Command Line Tool")
+app = typer.Typer(help="DyRCA: Root Cause Analysis Command Line Tool")
 
 
 @app.command()
@@ -51,12 +53,27 @@ def preprocess(
         typer.echo(f"Max cases: {max_cases}")
 
     try:
-        result = run_preprocessing(
-            data_root=data_root,
-            output_dir=output_dir,
-            max_cases=max_cases,
-            ds=dataset_type,
-        )
+        if dataset_type == "RCAEVAL_re2_ob":
+            result=run_preprocessing_rcaeval(
+                data_root=data_root,
+                output_dir=output_dir,
+                max_cases=max_cases,
+                ds=dataset_type,
+            )
+        elif dataset_type == "Eadro_sn":
+            result=run_preprocessing_eadro(
+                data_root=data_root,
+                output_dir=output_dir,
+                max_cases=max_cases,
+                ds=dataset_type,
+            )
+        else:
+            result = run_preprocessing(
+                data_root=data_root,
+                output_dir=output_dir,
+                max_cases=max_cases,
+                ds=dataset_type,
+            )
 
         typer.echo("\nPreprocessing completed successfully!")
         typer.echo(
@@ -71,20 +88,20 @@ def preprocess(
 @app.command()
 def train(
     train_samples_path: str = typer.Option(
-        "data/RCABENCH/samples/train_samples.pkl", help="Path to samples pickle file"
+        "data/RCABENCH/samples/train_samples_v2.pkl", help="Path to samples pickle file"
     ),
     train_labels_path: str = typer.Option(
-        "data/RCABENCH/samples/train_labels.pkl", help="Path to labels pickle file"
+        "data/RCABENCH/samples/train_labels_v2.pkl", help="Path to labels pickle file"
     ),
     test_samples_path: str = typer.Option(
-        "data/RCABENCH/samples/test_samples.pkl", help="Path to samples pickle file"
+        "data/RCABENCH/samples/test_samples_v2.pkl", help="Path to samples pickle file"
     ),
     test_labels_path: str = typer.Option(
-        "data/RCABENCH/samples/test_labels.pkl", help="Path to labels pickle file"
+        "data/RCABENCH/samples/test_labels_v2.pkl", help="Path to labels pickle file"
     ),
     seed: int = typer.Option(42, help="Random seed for data splitting"),
     output_model: str = typer.Option("best_rca_model.pth", help="Output model path"),
-    epochs: int = typer.Option(20, help="Number of training epochs"),
+    epochs: int = typer.Option(30, help="Number of training epochs"),
     batch_size: int = typer.Option(32, help="Batch size for training"),
     learning_rate: float = typer.Option(1e-3, help="Learning rate"),
     hidden_dim: int = typer.Option(32, help="Hidden dimension"),
@@ -126,38 +143,38 @@ def train(
     with open(test_labels_path, "rb") as f:
         test_labels = pickle.load(f)  # list of tensors (length = num_nodes)
 
-    ###让label type一致
+    ### Make label types consistent
     def filter_samples_by_labels(train_labels, train_samples, test_labels):
-        # 1. 统计测试集中出现的非零类别
+    # 1. Count nonzero classes appearing in the test set
         test_labels_tensor = torch.stack(test_labels)
         test_classes = set(torch.where(test_labels_tensor.sum(dim=0) > 0)[0].tolist())
         
-        # 2. 筛选训练集中的样本
+    # 2. Filter samples in the training set
         filtered_train_labels = []
         filtered_train_samples = []
         
         for label, sample in zip(train_labels, train_samples):
-            # 获取当前标签的类别索引（假设是one-hot编码）
+            # Get the class index of the current label (assuming one-hot encoding)
             class_idx = torch.argmax(label).item()
             
-            # 保留测试集中存在的类别样本
+            # Keep samples whose class exists in the test set
             if class_idx in test_classes:
                 filtered_train_labels.append(label)
                 filtered_train_samples.append(sample)
         
         return filtered_train_labels, filtered_train_samples
 
-    train_labels, train_samples = filter_samples_by_labels(
-        train_labels, train_samples, test_labels
-    )
+    # train_labels, train_samples = filter_samples_by_labels(
+    #     train_labels, train_samples, test_labels
+    # )
 
-    # 验证过滤后的训练集类别是否都在测试集中
-    train_classes = set(torch.argmax(torch.stack(train_labels), dim=1).tolist())
-    test_classes = set(torch.argmax(torch.stack(test_labels), dim=1).tolist())
+    # # Verify that all classes in the filtered training set exist in the test set
+    # train_classes = set(torch.argmax(torch.stack(train_labels), dim=1).tolist())
+    # test_classes = set(torch.argmax(torch.stack(test_labels), dim=1).tolist())
 
-    print("过滤后的训练集类别:", train_classes)
-    print("测试集类别:", test_classes)
-    print("训练集类别是否都在测试集中:", train_classes.issubset(test_classes))
+    # print("Filtered train set classes:", train_classes)
+    # print("Test set classes:", test_classes)
+    # print("Are all train classes in test set:", train_classes.issubset(test_classes))
 
     train_dataset = RCADataset(train_samples, train_labels)
     test_dataset = RCADataset(test_samples, test_labels)
@@ -210,10 +227,10 @@ def train(
 @app.command()
 def test(
     samples_path: str = typer.Option(
-        "data/RCABENCH/samples/test_samples.pkl", help="Path to samples pickle file"
+        "data/RCABENCH/samples/test_samples_v2.pkl", help="Path to samples pickle file"
     ),
     labels_path: str = typer.Option(
-        "data/RCABENCH/samples/test_labels.pkl", help="Path to labels pickle file"
+        "data/RCABENCH/samples/test_labels_v2.pkl", help="Path to labels pickle file"
     ),
     seed: int = typer.Option(42, help="Random seed for data splitting"),
     model_path: str = typer.Option("best_rca_model.pth", help="Path to trained model"),
@@ -461,20 +478,24 @@ def predict(
 
 @app.command()
 def incremental_train(
-    samples_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_samples1.pkl",
-        help="Path to new samples pickle file for incremental training"
+    train_samples_path: str = typer.Option(
+        "data/RCABENCH/samples/train_samples_v1.pkl", help="Path to samples pickle file"
     ),
-    labels_path: str = typer.Option(
-        "data/RCABENCH/samples/abnormal_labels1.pkl",
-        help="Path to new labels pickle file for incremental training"
+    train_labels_path: str = typer.Option(
+        "data/RCABENCH/samples/train_labels_v1.pkl", help="Path to labels pickle file"
+    ),
+    test_samples_path: str = typer.Option(
+        "data/RCABENCH/samples/test_samples_v1.pkl", help="Path to samples pickle file"
+    ),
+    test_labels_path: str = typer.Option(
+        "data/RCABENCH/samples/test_labels_v1.pkl", help="Path to labels pickle file"
     ),
     pretrained_model_path: str = typer.Option(
-        "best_rca_model.pth",
+        "best_model_v1.pth",
         help="Path to pretrained model checkpoint"
     ),
     output_model: str = typer.Option(
-        "best_rca_model.pth",
+        "best_model_v1-1.pth",
         help="Output path for the incrementally trained model (will overwrite if exists)"
     ),
     seed: int = typer.Option(42, help="Random seed for data splitting"),
@@ -497,11 +518,17 @@ def incremental_train(
     typer.echo(f"Using device: {device_obj}")
 
     # Check files
-    if not os.path.exists(samples_path):
-        typer.echo(f"Error: Samples file not found: {samples_path}", err=True)
+    if not os.path.exists(train_samples_path):
+        typer.echo(f"Error: Samples file not found: {train_samples_path}", err=True)
         raise typer.Exit(1)
-    if not os.path.exists(labels_path):
-        typer.echo(f"Error: Labels file not found: {labels_path}", err=True)
+    if not os.path.exists(train_labels_path):
+        typer.echo(f"Error: Labels file not found: {train_labels_path}", err=True)
+        raise typer.Exit(1)
+    if not os.path.exists(test_samples_path):
+        typer.echo(f"Error: Samples file not found: {test_samples_path}", err=True)
+        raise typer.Exit(1)
+    if not os.path.exists(test_labels_path):
+        typer.echo(f"Error: Labels file not found: {test_labels_path}", err=True)
         raise typer.Exit(1)
     if not os.path.exists(pretrained_model_path):
         typer.echo(f"Error: Pretrained model not found: {pretrained_model_path}", err=True)
@@ -509,22 +536,63 @@ def incremental_train(
 
     # Load dataset
     typer.echo("Loading new dataset for incremental training...")
-    with open(samples_path, "rb") as f:
-        samples = pickle.load(f)  # list of (features, graph) tuples
-    with open(labels_path, "rb") as f:
-        labels = pickle.load(f)  # list of tensors (length = num_nodes)
-    full_dataset = RCADataset(samples, labels)
+    with open(train_samples_path, "rb") as f:
+        train_samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(train_labels_path, "rb") as f:
+        train_labels = pickle.load(f)  # list of tensors (length = num_nodes)
+
+    with open(test_samples_path, "rb") as f:
+        test_samples = pickle.load(f)  # list of (features, graph) tuples
+    with open(test_labels_path, "rb") as f:
+        test_labels = pickle.load(f)  # list of tensors (length = num_nodes)
+
+
+    ###让label type一致
+    def filter_samples_by_labels(train_labels, train_samples, test_labels):
+        # 1. 统计测试集中出现的非零类别
+        test_labels_tensor = torch.stack(test_labels)
+        test_classes = set(torch.where(test_labels_tensor.sum(dim=0) > 0)[0].tolist())
+        
+        # 2. 筛选训练集中的样本
+        filtered_train_labels = []
+        filtered_train_samples = []
+        
+        for label, sample in zip(train_labels, train_samples):
+            # 获取当前标签的类别索引（假设是one-hot编码）
+            class_idx = torch.argmax(label).item()
+            
+            # 保留测试集中存在的类别样本
+            if class_idx in test_classes:
+                filtered_train_labels.append(label)
+                filtered_train_samples.append(sample)
+        
+        return filtered_train_labels, filtered_train_samples
+
+    train_labels, train_samples = filter_samples_by_labels(
+        train_labels, train_samples, test_labels
+    )
+
+    # 验证过滤后的训练集类别是否都在测试集中
+    train_classes = set(torch.argmax(torch.stack(train_labels), dim=1).tolist())
+    test_classes = set(torch.argmax(torch.stack(test_labels), dim=1).tolist())
+
+    print("过滤后的训练集类别:", train_classes)
+    print("测试集类别:", test_classes)
+    print("训练集类别是否都在测试集中:", train_classes.issubset(test_classes))
+
+    train_dataset = RCADataset(train_samples, train_labels)
+    test_dataset = RCADataset(test_samples, test_labels)
 
     # Get model parameters
-    num_nodes = full_dataset.num_nodes
-    feature_dim = full_dataset.samples[0][0].shape[-1]
+    num_nodes = train_dataset.num_nodes
+    feature_dim = train_dataset.samples[0][0].shape[-1]
     typer.echo(
-        f"Dataset loaded: {len(full_dataset)} samples, {num_nodes} nodes, {feature_dim} features"
+        f"Dataset loaded: {len(train_dataset)} samples, {num_nodes} nodes, {feature_dim} features"
     )
 
     # Create data loaders
-    train_loader, val_loader, _ = prepare_data_loaders(
-        full_dataset, batch_size=batch_size, seed=seed
+    train_loader, val_loader, test_loader = prepare_data_loaders(
+        train_dataset, test_dataset, batch_size=batch_size, seed=seed
     )
 
     # Initialize model (must match pretrained model architecture)
@@ -540,7 +608,7 @@ def incremental_train(
     model = incremental_train_model(
         model,
         train_loader,
-        val_loader,
+        test_loader,
         device_obj,
         num_epochs=epochs,
         lr=learning_rate,

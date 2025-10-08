@@ -21,18 +21,21 @@ class RCADataset(Dataset):
 
     def __getitem__(self, idx):
         # Get temporal features and graph structure
-        features, g = self.samples[idx]
+        features, g, normal_features, normal_g = self.samples[idx]
         features = torch.tensor(
             features, dtype=torch.float32
         )  # [time_window, nodes, metrics]
+        normal_features = torch.tensor(
+            normal_features, dtype=torch.float32
+        )  # [time_window, nodes, metrics]
         label = self.labels[idx].float()  # Convert to float type
 
-        return features, g, label
+        return features, g, normal_features, normal_g, label
 
 
 def collate_fn(batch):
     """Custom batch function to handle DGL graph batching"""
-    features_list, graphs_list, labels_list = zip(*batch)
+    features_list, graphs_list, normal_features_list, normal_graphs_list, labels_list = zip(*batch)
 
     # Stack temporal features [batch_size, time_window, nodes, metrics]
     features = torch.stack(features_list, dim=0)
@@ -40,7 +43,13 @@ def collate_fn(batch):
     # Merge graphs using dgl.batch
     batched_graph = dgl.batch(graphs_list)
 
+    # Stack normal temporal features [batch_size, time_window, nodes, metrics]
+    normal_features = torch.stack(normal_features_list, dim=0)
+
+    # Merge normal graphs using dgl.batch
+    normal_batched_graph = dgl.batch(normal_graphs_list)
+
     # Stack labels [batch_size, num_nodes]
     labels = torch.stack(labels_list, dim=0)
 
-    return features, batched_graph, labels
+    return features, batched_graph, normal_features, normal_batched_graph, labels

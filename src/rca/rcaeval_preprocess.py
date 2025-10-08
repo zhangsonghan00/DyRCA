@@ -14,22 +14,20 @@ from rcabench.openapi import InjectionApi, ApiClient, Configuration
 
 import statistics  # For trace latency std calculation
 import typer
+import datetime
+import shutil
 
 from enum import Enum, auto  # Import Enum base class and auto value generator
 
 
 class Dataset(Enum):  # Define an Enum class named Dataset, inheriting from Enum
-    RCABENCH_database = auto()
-    RCABENCH_filtered = auto()
-    RCABENCH_r1 = auto()
-    RCABENCH_r2 = auto()
     RCAEVAL_re2_ob = auto()
 
 
 # Configuration parameters
-SAMPLING_SIZE = 5  # Data smoothing granularity: 5 seconds
+SAMPLING_SIZE = 1  # Data smoothing granularity: 1 second
 WINDOW_SIZE = 10  # Sliding window size: 10 sampling points
-SLIDING_STEP = 3  # Sliding step size
+SLIDING_STEP = 5  # Sliding step size
     
 
 from typing import Union
@@ -38,78 +36,15 @@ def create_dataset(
     data_root: str,
     output_dir: str,
     max_cases: Optional[int] = None,
-    ds: str = "RCABENCH_r1",
-) -> Union[List[Path], Tuple[List[Path], List[Path]]]:
-    if ds == "rcabench":
-        dataset = Dataset.RCABENCH_database
-    elif ds == "rcabench_filtered":
-        dataset = Dataset.RCABENCH_filtered
-    elif ds == "RCABENCH_r1":
-        dataset = Dataset.RCABENCH_r1
-    elif ds == "RCABENCH_r2":
-        dataset = Dataset.RCABENCH_r2
-    elif ds == "RCAEVAL_re2_ob":
+    ds: str = "RCAEVAL_re2_ob",
+) -> Tuple[List[Path], List[Path]]:
+    if ds == "RCAEVAL_re2_ob":
         dataset = Dataset.RCAEVAL_re2_ob
 
     logger.info("Starting dataset creation...")
     output_path = Path(output_dir) / ds
-
-    if dataset == Dataset.RCABENCH_database:
-        config = Configuration(host="http://10.10.10.220:32080")
-        with ApiClient(configuration=config) as client:
-            api = InjectionApi(api_client=client)
-            resp = api.api_v1_injections_analysis_with_issues_get()
-
-        assert resp.data is not None, "No cases found in the response"
-        case_names = list(
-            set([item.injection_name for item in resp.data if item.injection_name])
-        )
-        # case_names = os.listdir(data_root)
-        data_packs = [Path(data_root) / name / "converted" for name in case_names]
-
-        data_packs = data_packs[:max_cases]
-
-    elif dataset == Dataset.RCABENCH_filtered:
-        logger.info(f"Using filtered dataset from {data_root}")
-        service_path_name = []
-
-        # Traverse directory
-        for root, dirs, files in os.walk(data_root):
-            for dir_name in dirs:
-                # if any(sample in dir_name for sample in service_select):
-                if "ts" in dir_name:
-                    service_path_name.append(dir_name)
-
-        data_packs = [Path(data_root) / name for name in service_path_name]
-
-        data_packs = data_packs[:max_cases]
-
-    elif dataset == Dataset.RCABENCH_r1 or dataset == Dataset.RCABENCH_r2:
-        logger.info(f"Using {ds} dataset from {data_root}")
-        # Use RCABENCH_r1 or RCABENCH_r2 dataset
-        if dataset == Dataset.RCABENCH_r1:
-            train_dir = Path(data_root) / "__dev__rcabench_train_r1"
-            test_dir = Path(data_root) / "__dev__rcabench_test_r1"
-        else:
-            train_dir = Path(data_root) / "__dev__rcabench_train_r2"
-            test_dir = Path(data_root) / "__dev__rcabench_test_r2"
-
-        if not train_dir.exists() or not test_dir.exists():
-            raise FileNotFoundError("Train or test directory does not exist")
-
-        train_cases = os.listdir(train_dir)
-        test_cases = os.listdir(test_dir)
-
-        train_data_packs = [train_dir / case for case in train_cases]
-        test_data_packs = [test_dir / case for case in test_cases]
-
-        if max_cases is not None:
-            train_data_packs = train_data_packs[:max_cases]
-            test_data_packs = test_data_packs[:max_cases]
-        
-        return train_data_packs, test_data_packs
     
-    elif dataset == Dataset.RCAEVAL_re2_ob:
+    if dataset == Dataset.RCAEVAL_re2_ob:
         logger.info(f"Using {ds} dataset from {data_root}")
         # Use RCAEVAL_re2_ob dataset
         data_dir = Path(data_root) / "rcaeval_re2_ob"
@@ -129,8 +64,8 @@ def create_dataset(
             test_data_packs = test_data_packs[:max_cases]
         
         return train_data_packs, test_data_packs
-    
-    return data_packs
+    else:
+        return [], []
 
 
 class DataPreprocessor:
@@ -174,35 +109,52 @@ class DataPreprocessor:
 
     def load_data(self) -> None:
         try:
+            # 优化：加载数据时清理空行，减少无效数据占用
             if os.path.exists(self.metrics_path):
                 self.metrics_df = pd.read_parquet(self.metrics_path)
                 self.metrics_df["value"] = self.metrics_df["value"].fillna(0)
+                # 清理关键列空值的行
+                self.metrics_df = self.metrics_df.dropna(subset=["time", "metric", "service_name"])
             else:
                 self.metrics_df = None
                 logger.warning(f"Metrics file not found: {self.metrics_path}")
                 
             if os.path.exists(self.traces_path):
                 self.traces_df = pd.read_parquet(self.traces_path)
+                self.traces_df = self.traces_df.dropna(subset=["time", "span_id", "service_name"])
             else:
                 self.traces_df = None
                 logger.warning(f"Traces file not found: {self.traces_path}")
                 
             if os.path.exists(self.logs_path):
                 self.logs_df = pd.read_parquet(self.logs_path)
+                self.logs_df = self.logs_df.dropna(subset=["time", "level", "service_name"])
             else:
                 self.logs_df = None
                 logger.warning(f"Logs file not found: {self.logs_path}")
                 
-            # If all data files do not exist, raise an exception
+            # 强制释放空DataFrame，避免占位
+            if self.metrics_df is not None and self.metrics_df.empty:
+                self.metrics_df = None
+            if self.traces_df is not None and self.traces_df.empty:
+                self.traces_df = None
+            if self.logs_df is not None and self.logs_df.empty:
+                self.logs_df = None
+                
+            # 如果所有数据文件都不存在，则抛出异常
             if all(df is None for df in [self.metrics_df, self.traces_df, self.logs_df]):
                 raise FileNotFoundError(f"No data files found at: {self.metrics_path}, {self.traces_path}, {self.logs_path}")
         except Exception as e:
             logger.error(f"Error loading data: {e}")
+            # 异常时强制释放所有大对象
+            self.metrics_df = None
+            self.traces_df = None
+            self.logs_df = None
             raise
 
     def preprocess_data(self) -> None:
         """Unified processing of metrics, traces, and logs data, extract features and build graph"""
-    # Check if at least one data source is available, but do not raise exception
+        # 检查是否至少有一个数据源可用，但不抛出异常
         if all(df is None for df in [self.metrics_df, self.traces_df, self.logs_df]):
             logger.warning("No data available for preprocessing")
             self.time_windows = []
@@ -225,7 +177,7 @@ class DataPreprocessor:
         # 5. Save edge info for later graph construction
         self.trace_edges_by_window = trace_edges
 
-    # If there is no time window data, return empty result
+        # 如果没有任何时间窗口数据，则返回空结果
         if not hasattr(self, 'time_windows') or not self.time_windows:
             logger.warning("No time windows found in data")
             self.time_windows = []
@@ -246,7 +198,7 @@ class DataPreprocessor:
             DataPreprocessor.extract_service_name, axis=1
         )  # type: ignore
         df = df.dropna(subset=["extracted_service"]).copy()
-        df.loc[:, "timestamp"] = df["time"].astype("int64") // 1_000_000_000
+        df.loc[:, "timestamp"] = df["time"].astype("int64") // 1_000_000
         df.loc[:, "time_window"] = df["timestamp"] // self.sampling_size
 
         # Aggregate by time window, service, metric
@@ -272,7 +224,9 @@ class DataPreprocessor:
                     feature_matrix[service_idx, metric_idx] = row["value"]
 
             features_by_window[window] = feature_matrix
-
+        
+        # 释放中间DataFrame
+        del df, grouped
         return features_by_window
 
     def _process_traces(self) -> Tuple[Dict[int, torch.Tensor], Dict[int, List[Dict]]]:
@@ -284,7 +238,7 @@ class DataPreprocessor:
             DataPreprocessor.extract_service_name, axis=1
         )  # type: ignore
         df = df.dropna(subset=["extracted_service"]).copy()
-        df.loc[:, "timestamp"] = df["time"].astype("int64") // 1_000_000_000
+        df.loc[:, "timestamp"] = df["time"].astype("int64") // 1_000_000
         df.loc[:, "time_window"] = df["timestamp"] // self.sampling_size
         # Build service call relationships
         df["source_service"] = df["extracted_service"]
@@ -299,7 +253,7 @@ class DataPreprocessor:
 
         df["destination_service"] = df.apply(find_destination, axis=1)  # type: ignore
         df = df.dropna(subset=["source_service", "destination_service"]).copy()
-        df["is_error"] = df["attr.status_code"].isin(["Error"])
+        df["is_error"] = df["attr.status_code"].isin([2,4,13,14])
         trace_features = {}
         trace_edges = {}
         time_windows = sorted(df["time_window"].unique())
@@ -355,7 +309,10 @@ class DataPreprocessor:
                     )
 
             trace_edges[window] = edge_list
-
+            trace_features[window] = feature_matrix
+        
+        # 释放中间DataFrame
+        del df, trace_stats, edge_stats
         return trace_features, trace_edges
 
     def _process_logs(self) -> Dict[int, torch.Tensor]:
@@ -372,9 +329,10 @@ class DataPreprocessor:
         df.loc[:, "time_window"] = df["timestamp"] // self.sampling_size
 
         # Count the number of logs at each level
-        log_levels = ["INFO", "ERROR", "WARN", "DEBUG"]
+        log_levels = ["info", "error", "warning", "debug"]
         log_counts = (
-            df.groupby(["time_window", "extracted_service", "level"])
+            df.assign(level=df["level"].str.lower())
+            .groupby(["time_window", "extracted_service", "level"])
             .size()
             .unstack(fill_value=0)
             .reset_index()
@@ -400,7 +358,9 @@ class DataPreprocessor:
                         feature_matrix[service_idx, i] = row[level]
 
             features_by_window[window] = feature_matrix
-
+        
+        # 释放中间DataFrame
+        del df, log_counts
         return features_by_window
 
     def _combine_features(
@@ -447,6 +407,9 @@ class DataPreprocessor:
             combined_features[window] = torch.cat(feature_list, dim=1)
 
         self.features_by_window = combined_features
+        
+        # 释放中间特征字典，减少内存占用
+        del metrics_features, trace_features, log_features
 
     def combine_data(self) -> Tuple[List[int], List[torch.Tensor], List[List[Dict]]]:
         """Return processed data for sliding window sampling"""
@@ -513,6 +476,9 @@ class DatasetPack:
                 )
 
                 samples.append((feature_sequence, window_graph))
+                
+                # 及时释放内存
+                del feature_sequence, window_graph
 
         return samples
 
@@ -568,7 +534,7 @@ class DatasetPack:
                 norm_call_freqs = minmax_normalize_np(call_freq_array)
                 norm_error_rates = minmax_normalize_np(error_rate_array)
 
-                # Build edges
+                # Build edges - 保留所有边，不做过滤
                 for idx, ((src, dst), _) in enumerate(edge_stats.items()):
                     src_list.append(src)
                     dst_list.append(dst)
@@ -641,6 +607,9 @@ def collect_all_services_and_metrics(
         all_metrics.update(metrics)
 
         typer.echo(f"Case {case_dir.name}: {len(services)} services, {len(metrics)} metrics")
+        
+        # 释放内存
+        del df
 
     return sorted(all_services), sorted(all_metrics)
 
@@ -671,10 +640,14 @@ def process_case(
     )
     processor.load_data()
     processor.preprocess_data()
-    return processor.combine_data()
+    result = processor.combine_data()
+    
+    # 释放processor占用的内存
+    del processor
+    return result
 
 
-def create_labels_for_case(
+def create_labels_for_casex(
     case_dir: Path, timestamps: List[int], all_services: List[str]
 ) -> List[torch.Tensor]:
     """Create labels for a single case"""
@@ -721,6 +694,38 @@ def create_labels_for_case(
                 label[fault_service_idx] = 1.0
         labels.append(label)
 
+    return labels
+
+def create_labels_for_case(
+    case_dir: Path, timestamps: List[int], all_services: List[str]
+) -> List[torch.Tensor]:
+    """Create labels for a single case based on directory name"""
+    # 从文件夹名称中提取服务名（如从"recommendationservice_mem_1"提取"recommendationservice"）
+    dir_name = case_dir.name  # 获取文件夹名称
+    
+    # 提取service_name
+    service_name = dir_name.split("_")[0]
+
+    # 找到服务在all_services中的索引
+    fault_service_idx = None
+    for i, service in enumerate(all_services):
+        if service_name in service or service in service_name:
+            fault_service_idx = i
+            break
+    
+    if fault_service_idx is None:
+        typer.echo(f"服务名 {service_name} 不在all_services列表中")
+        return [torch.zeros(len(all_services)) for _ in timestamps]
+
+    # 为每个timestamp创建标签（所有时间戳都标记该服务为异常）
+    labels = []
+    for _ in timestamps:
+        label = torch.zeros(len(all_services))
+        label[fault_service_idx] = 1.0  # 标记为异常
+        labels.append(label)
+    
+    # 释放中间变量
+    del service_name, fault_service_idx
     return labels
 
 
@@ -777,7 +782,7 @@ def create_dataset_for_training(
             if case_dir == normal_case_dir and normal_timestamps is not None:
                 case_to_normal[case_dir] = j
                 break
-    
+
     for i, (timestamps, features, edges, case_dir) in enumerate(case_data_list):
         # 创建abnormal样本
         pack = DatasetPack(timestamps, features, edges)
@@ -809,15 +814,18 @@ def create_dataset_for_training(
             typer.echo(f"No normal window for case: {case_dir}")
         for abnormal_feature, abnormal_graph in abnormal_samples:
             all_samples.append((abnormal_feature, abnormal_graph, normal_feature_tensor, normal_graph))
+        
+        # 释放当前case的内存
+        del pack, abnormal_samples, normal_feature_tensor, normal_graph
     
     return all_samples
 
 
 def main():
-    output_dir = "data/RCABENCH"
+    output_dir = "data/RCAEVAL_re2_ob"
     
     # Use RCABENCH_r1 dataset which returns train/test splits
-    result = run_preprocessing(
+    result = run_preprocessing_rcaeval(
         data_root="/mnt/jfs/rcabench-platform-v2/data",  # Adjust path as needed
         output_dir=output_dir,
         max_cases=30,
@@ -830,16 +838,25 @@ def main():
     typer.echo(f"Total services: {result['num_services']}")
     typer.echo(f"Total metrics: {result['num_metrics']}")
 
-
-def run_preprocessing(
+import psutil
+def run_preprocessing_rcaeval(
     data_root: str,
     output_dir: str,
     max_cases: Optional[int] = None,
-    ds: str = "rcabench",
+    ds: str = "RCAEVAL_re2_ob",
 ):
     """Main function to run data preprocessing for both train and test sets"""
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "samples"), exist_ok=True)
+
+    # 优化：根据系统内存自动调整max_cases
+    total_memory_gb = psutil.virtual_memory().total / (1024**3)
+    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    logger.info(f"System memory: {total_memory_gb:.1f}GB total, {available_memory_gb:.1f}GB available")
+    
+    # 自动计算最大可处理的case数量（每case约占用2GB内存）
+    max_cases_auto = int(available_memory_gb // 2)
+    max_cases_auto = max(1, min(max_cases_auto, 30))  # 限制在1-30之间
 
     # Get data pack paths - now returns train and test separately
     dataset_result = create_dataset(
@@ -881,7 +898,7 @@ def run_preprocessing(
     with open(os.path.join(output_dir, "metric_to_idx.pkl"), "wb") as f:
         pickle.dump(metric_to_idx, f)
 
-    def process_data_packs(data_packs, data_type="train"):
+    def process_data_packs(data_packs, data_type="train",ds="RCAEVAL_re2_ob"):
         """Process a list of data packs and return samples and labels"""
         case_data = []
         normal_case_data = []  # 存储normal数据
@@ -890,9 +907,52 @@ def run_preprocessing(
         logger.info(f"Processing {data_type} data...")
         for case_dir in tqdm(data_packs, desc=f"Processing {data_type} cases"):
             try:
-                # 处理abnormal数据
+                cache_dir = os.path.join(case_dir, "cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                
+                # 1. 读取注入时间
+                inject_time_path = os.path.join(case_dir, "inject_time.txt")
+                with open(inject_time_path, 'r') as f:
+                    inject_timestamp = int(f.read().strip())
+                inject_time = datetime.datetime.fromtimestamp(inject_timestamp, datetime.UTC)
+                
+                # 2. 处理metrics文件
+                metric_path = os.path.join(case_dir, "simple_metrics.parquet")
+                metric_df = pd.read_parquet(metric_path)
+
+                # 区分正常和异常metrics并保存到缓存
+                normal_metrics = metric_df[metric_df["time"] < inject_time]
+                abnormal_metrics = metric_df[metric_df["time"] >= inject_time]
+                normal_metrics.to_parquet(os.path.join(cache_dir, "normal_metrics.parquet"))
+                abnormal_metrics.to_parquet(os.path.join(cache_dir, "abnormal_metrics.parquet"))
+
+                # 3. 处理traces文件
+                trace_path = os.path.join(case_dir, "traces.parquet")
+                trace_df = pd.read_parquet(trace_path)
+
+                # 区分正常和异常traces并保存到缓存
+                normal_traces = trace_df[trace_df["time"] < inject_time]
+                abnormal_traces = trace_df[trace_df["time"] >= inject_time]
+                normal_traces.to_parquet(os.path.join(cache_dir, "normal_traces.parquet"))
+                abnormal_traces.to_parquet(os.path.join(cache_dir, "abnormal_traces.parquet"))
+
+                # 4. 处理logs文件
+                log_path = os.path.join(case_dir, "logs.parquet")
+                log_df = pd.read_parquet(log_path)
+
+                # 区分正常和异常logs并保存到缓存
+                normal_logs = log_df[log_df["time"] < inject_time]
+                abnormal_logs = log_df[log_df["time"] >= inject_time]
+                normal_logs.to_parquet(os.path.join(cache_dir, "normal_logs.parquet"))
+                abnormal_logs.to_parquet(os.path.join(cache_dir, "abnormal_logs.parquet"))
+
+                # 释放原始数据DataFrame内存
+                del metric_df, trace_df, log_df
+                
+                # 5. 使用缓存文件调用原process_case函数
+                # 处理abnormal数据（使用缓存目录）
                 timestamps, features, edges = process_case(
-                    case_dir,
+                    Path(cache_dir),  # 使用缓存目录作为数据源
                     "abnormal_metrics.parquet",
                     "abnormal_traces.parquet",
                     "abnormal_logs.parquet",
@@ -900,20 +960,24 @@ def run_preprocessing(
                     all_metrics,
                 )
                 
-                # 处理normal数据
+                # 处理normal数据（使用缓存目录）
                 try:
                     normal_timestamps, normal_features, normal_edges = process_case(
-                        case_dir,
+                        Path(cache_dir),  # 使用缓存目录作为数据源
                         "metrics.parquet",
                         "traces.parquet",
                         "logs.parquet",
                         all_services,
                         all_metrics,
-                        normal_prefix="normal_"  # 添加normal前缀
+                        normal_prefix="normal_"
                     )
                 except Exception as e:
                     logger.warning(f"Error processing normal data for {case_dir}: {e}")
                     normal_timestamps, normal_features, normal_edges = None, None, None
+                
+                # 6. 清理缓存目录
+                shutil.rmtree(cache_dir)
+                logger.info(f"Cleared cache for {case_dir}")
                 
                 if timestamps:
                     case_data.append((timestamps, features, edges, case_dir))
@@ -928,11 +992,20 @@ def run_preprocessing(
                         
                     labels = create_labels_for_case(case_dir, timestamps, all_services)
                     labels_by_case.append(labels)
+                
+                # 核心优化：释放当前case的大对象内存
+                del timestamps, features, edges, labels
+                del normal_timestamps, normal_features, normal_edges
+                
             except Exception as e:
                 logger.warning(f"Error processing case {case_dir}: {e}")
+                # 异常时强制清理内存
+                try:
+                    del timestamps, features, edges, labels
+                    del normal_timestamps, normal_features, normal_edges
+                except:
+                    pass
                 continue
-
-        # 整合abnormal和normal的所有特征用于标准化
         logger.info(f"Normalizing {data_type} features...")
         all_features = []
         
@@ -973,6 +1046,26 @@ def run_preprocessing(
                         normal_case_data[i][3]  # 保留case_dir
                     )
                     abnormal_idx += num_windows
+            del all_features, normalized_features  # 释放内存
+        
+        # # 优化：按case单独归一化特征，避免缓存全量特征
+        # logger.info(f"Normalizing {data_type} features...")
+        
+        # # 归一化abnormal特征
+        # for i in range(len(case_data)):
+        #     timestamps, features, edges, case_dir = case_data[i]
+        #     if features:
+        #         normalized_features = minmax_normalize_features(features)
+        #         case_data[i] = (timestamps, normalized_features, edges, case_dir)
+        #         del features  # 释放原特征内存
+        
+        # # 归一化normal特征
+        # for i in range(len(normal_case_data)):
+        #     timestamps, features, edges, case_dir = normal_case_data[i]
+        #     if features:
+        #         normalized_features = minmax_normalize_features(features)
+        #         normal_case_data[i] = (timestamps, normalized_features, edges, case_dir)
+        #         del features  # 释放原特征内存
 
         # 创建滑动窗口样本，包括normal数据
         logger.info(f"Creating {data_type} sliding window samples...")
@@ -987,18 +1080,21 @@ def run_preprocessing(
                 for i in range(0, len(case_labels) - WINDOW_SIZE + 1, SLIDING_STEP):
                     # Use the label of the last time as the sample label
                     sample_labels.append(case_labels[i + WINDOW_SIZE - 1])
+        
+        # 释放中间变量
+        del case_data, normal_case_data, labels_by_case
 
         return samples, sample_labels
 
     # Process train data
     if train_data_packs:
-        train_samples, train_labels = process_data_packs(train_data_packs, "train")
+        train_samples, train_labels = process_data_packs(train_data_packs, "train", ds)
         
         # Save train data
         logger.info(f"Saving {len(train_samples)} train samples...")
-        with open(os.path.join(output_dir, "samples", "train_samples.pkl"), "wb") as f:
+        with open(os.path.join(output_dir, "samples", "train_samples_v1.pkl"), "wb") as f:
             pickle.dump(train_samples, f)
-        with open(os.path.join(output_dir, "samples", "train_labels.pkl"), "wb") as f:
+        with open(os.path.join(output_dir, "samples", "train_labels_v1.pkl"), "wb") as f:
             pickle.dump(train_labels, f)
 
         # Output train statistics
@@ -1014,18 +1110,21 @@ def run_preprocessing(
                 typer.echo(f"Train normal graph node count: {normal_graph.num_nodes()}")
                 typer.echo(f"Train normal graph edge count: {normal_graph.num_edges()}")
             typer.echo(f"Train label shape: {train_labels[0].shape if train_labels else 'N/A'}")
+            
+            # 释放内存
+            del sample_features, sample_graph, normal_features, normal_graph
     else:
         train_samples, train_labels = [], []
 
     # Process test data
     if test_data_packs:
-        test_samples, test_labels = process_data_packs(test_data_packs, "test")
+        test_samples, test_labels = process_data_packs(test_data_packs, "test", ds)
         
         # Save test data
         logger.info(f"Saving {len(test_samples)} test samples...")
-        with open(os.path.join(output_dir, "samples", "test_samples.pkl"), "wb") as f:
+        with open(os.path.join(output_dir, "samples", "test_samples_v1.pkl"), "wb") as f:
             pickle.dump(test_samples, f)
-        with open(os.path.join(output_dir, "samples", "test_labels.pkl"), "wb") as f:
+        with open(os.path.join(output_dir, "samples", "test_labels_v1.pkl"), "wb") as f:
             pickle.dump(test_labels, f)
 
         # Output test statistics
@@ -1041,6 +1140,9 @@ def run_preprocessing(
                 typer.echo(f"Test normal graph node count: {normal_graph.num_nodes()}")
                 typer.echo(f"Test normal graph edge count: {normal_graph.num_edges()}")
             typer.echo(f"Test label shape: {test_labels[0].shape if test_labels else 'N/A'}")
+            
+            # 释放内存
+            del sample_features, sample_graph, normal_features, normal_graph
     else:
         test_samples, test_labels = [], []
 
@@ -1051,10 +1153,10 @@ def run_preprocessing(
         "num_test_samples": len(test_samples),
         "num_services": len(all_services),
         "num_metrics": len(all_metrics),
-        "train_samples_path": os.path.join(output_dir, "samples", "train_samples.pkl") if train_data_packs else None,
-        "train_labels_path": os.path.join(output_dir, "samples", "train_labels.pkl") if train_data_packs else None,
-        "test_samples_path": os.path.join(output_dir, "samples", "test_samples.pkl") if test_data_packs else None,
-        "test_labels_path": os.path.join(output_dir, "samples", "test_labels.pkl") if test_data_packs else None,
+        "train_samples_path": os.path.join(output_dir, "samples", "train_samples_v1.pkl") if train_data_packs else None,
+        "train_labels_path": os.path.join(output_dir, "samples", "train_labels_v1.pkl") if train_data_packs else None,
+        "test_samples_path": os.path.join(output_dir, "samples", "test_samples_v1.pkl") if test_data_packs else None,
+        "test_labels_path": os.path.join(output_dir, "samples", "test_labels_v1.pkl") if test_data_packs else None,
     }
 
 
@@ -1126,10 +1228,3 @@ if __name__ == "__main__":
     # main()
     data_pack=Path("/mnt/jfs/rcabench_dataset/ts5-ts-ui-dashboard-request-replace-method-fjhvwr/converted")
     x=run_single_pack_preprocessing(data_pack, output_dir="data/RCABENCH")
-    # path= Path(__file__).parent / 'data/RCABENCH/samples/abnormal_samples.pkl'
-    # with open(path, 'rb') as f:
-    #     abnormal_samples = pickle.load(f)
-    # print(abnormal_samples[1][0].shape)
-    # print(abnormal_samples[1])
-    # for i in range(10):
-    #     print(abnormal_samples[i][0][1,1,-6:-1])

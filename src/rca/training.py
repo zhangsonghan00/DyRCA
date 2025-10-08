@@ -13,11 +13,11 @@ import dgl
 
 def bidirectional_pairwise_ranking_loss(logits, root_idx, graph, margin=0.1, max_depth=2):
     """
-    logits: (N,), 每个节点的预测得分
-    root_idx: 根因节点的索引
-    graph: DGLGraph，单个调用图
-    margin: pairwise 的最小分数间隔
-    max_depth: 最大传播链长度
+    logits: (N,), prediction score for each node
+    root_idx: index of the root cause node
+    graph: DGLGraph, single call graph
+    margin: minimum score margin for pairwise
+    max_depth: maximum propagation chain length
     """
     device = logits.device
     loss = torch.tensor(0.0, device=device)
@@ -42,7 +42,7 @@ def bidirectional_pairwise_ranking_loss(logits, root_idx, graph, margin=0.1, max
         visited |= frontier
         frontier = next_frontier
 
-    # 防止根因节点被当作负样本
+    # Prevent the root cause node from being treated as a negative sample
     affected_nodes.discard(root_idx)
 
     for neg_idx in affected_nodes:
@@ -54,8 +54,54 @@ def bidirectional_pairwise_ranking_loss(logits, root_idx, graph, margin=0.1, max
         return torch.tensor(0.0, device=device)
     return loss / total_pairs
 
+def cross_period_discrepancy_loss(anomaly_emb, normal_emb, root_idx, margin=0.1, distance_type="euclidean"):
+    """
+    CPD Loss based on high-dimensional intermediate representations
+    anomaly_emb: GAT representation during anomaly period (B, N, E2) → single sample is (N, E2)
+    normal_emb: GAT representation during normal period (B, N, E2) → single sample is (N, E2)
+    root_idx: index of root cause node (B,) → single sample is scalar
+    margin: minimum margin of discrepancy between root cause and other nodes
+    distance_type: method for calculating discrepancy (euclidean/cosine/l1)
+    """
+    device = anomaly_emb.device
+    batch_size, num_nodes, _ = anomaly_emb.size()
+    loss = torch.tensor(0.0, device=device)
+    total_pairs = 0
 
-def train_model(model, output_model, train_loader, val_loader, device, num_epochs=50, lr=1e-3):
+    for i in range(batch_size):
+    # Abnormal/normal representation for a single sample
+        a_emb = anomaly_emb[i]  # (N, E2)
+        n_emb = normal_emb[i]  # (N, E2)
+        root = root_idx[i].item()  # 单个样本的根因索引
+
+    # 1. Calculate anomaly-normal discrepancy for each node
+        if distance_type == "euclidean":
+            discrepancy = torch.norm(a_emb - n_emb, dim=1)  # (N,), Euclidean distance per node
+        elif distance_type == "cosine":
+            discrepancy = 1 - F.cosine_similarity(a_emb, n_emb, dim=1)  # (N,), cosine distance
+        elif distance_type == "l1":
+            discrepancy = torch.norm(a_emb - n_emb, p=1, dim=1)  # (N,), L1 distance
+        else:
+            raise ValueError("distance_type must be euclidean/cosine/l1")
+
+    # 2. Discrepancy of root cause node vs other nodes
+        root_dis = discrepancy[root]
+        other_nodes = [j for j in range(num_nodes) if j != root]
+        if not other_nodes:
+            continue
+
+    # 3. Pairwise comparison: root cause discrepancy should be >= other node discrepancy + margin
+        for node_j in other_nodes:
+            diff = margin - (root_dis - discrepancy[node_j])
+            loss += torch.relu(diff)
+            total_pairs += 1
+
+    if total_pairs == 0:
+        return torch.tensor(0.0, device=device)
+    return loss / total_pairs
+
+
+def train_model(model, output_model, train_loader, val_loader, device, num_epochs=20, lr=1e-3):
     # criterion = nn.BCEWithLogitsLoss()  # With sigmoid, suitable for one-hot labels
     criterion = nn.CrossEntropyLoss()  # For multi-class classification
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -69,25 +115,28 @@ def train_model(model, output_model, train_loader, val_loader, device, num_epoch
         model.train()
         train_loss = 0.0
 
-        # Training process
+    # Training process
         with tqdm(train_loader, unit="batch") as tepoch:
             tepoch.set_description(f"Epoch {epoch + 1}/{num_epochs}")
 
-            for features, graphs, labels in tepoch:
+            for features, graphs, normal_features, normal_graphs, labels in tepoch:
                 # Move data to device
                 features = features.to(device)
                 graphs = graphs.to(device)
+                normal_features = normal_features.to(device)
+                normal_graphs = normal_graphs.to(device)
                 # labels = labels.to(device)
                 labels = torch.argmax(labels, dim=1).to(device)
 
                 # Forward pass
                 optimizer.zero_grad()
-                outputs = model(features, graphs)
+                outputs, anomaly_gat_emb = model(features, graphs)
+                normal_outputs, normal_gat_emb = model(normal_features, normal_graphs)
 
                 # Compute loss
                 loss = criterion(outputs, labels)
 
-                # add pairwise-ranking loss
+                # # add pairwise-ranking loss
                 batched_graphs = dgl.unbatch(graphs)
                 pairwise_losses = []
                 for i in range(len(batched_graphs)):
@@ -98,7 +147,16 @@ def train_model(model, output_model, train_loader, val_loader, device, num_epoch
                     pairwise_losses.append(loss_r)
                 pairwise_loss = torch.stack(pairwise_losses).mean()
 
-                loss = loss + 0.5 * pairwise_loss
+                # add cross-period discrepancy loss
+                cpd_loss = cross_period_discrepancy_loss(
+                    anomaly_emb=anomaly_gat_emb,
+                    normal_emb=normal_gat_emb,
+                    root_idx=labels,
+                    margin=0.1,
+                    distance_type="cosine"  # Try cosine first, then adjust based on results
+                )
+
+                loss = loss + 0.2 * pairwise_loss + 0.1 * cpd_loss
                 train_loss += loss.item() * features.size(0)
 
                 # Backward and optimize
@@ -108,43 +166,43 @@ def train_model(model, output_model, train_loader, val_loader, device, num_epoch
                 # Update progress bar
                 tepoch.set_postfix(loss=loss.item())
 
-        # Calculate average training loss
+    # Calculate average training loss
         train_loss /= len(train_loader.dataset)
 
-        # Validation process
+    # Validation process
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for features, graphs, labels in val_loader:
+            for features, graphs, normal_features, normal_graphs, labels in val_loader:
                 features = features.to(device)
                 graphs = graphs.to(device)
                 # labels = labels.to(device)
                 labels = torch.argmax(labels, dim=1).to(device)
 
-                outputs = model(features, graphs)
+                outputs, _ = model(features, graphs)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item() * features.size(0)
 
         val_loss /= len(val_loader.dataset)
 
-        # Learning rate scheduling
+    # Learning rate scheduling
         scheduler.step()
 
-        # Print training info
+    # Print training info
         typer.echo(f"Epoch {epoch + 1}/{num_epochs}")
         typer.echo(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
         typer.echo(f"Current LR: {optimizer.param_groups[0]['lr']:.8f}")
 
-        # Save best model
+    # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), best_model_path)
             typer.echo(f"Saved best model (Val Loss: {best_val_loss:.6f})")
-        # else:
-        #     typer.echo(f"Early stopping triggered at epoch {epoch}")
-        #     break
+    # else:
+    #     typer.echo(f"Early stopping triggered at epoch {epoch}")
+    #     break
 
-        # Print test details every 2 epochs
+    # Print test details every 2 epochs
         if (epoch + 1) % 1 == 0:
             typer.echo("-" * 50)
             test_results,_ = test_model(model, val_loader, device)
@@ -152,87 +210,6 @@ def train_model(model, output_model, train_loader, val_loader, device, num_epoch
                 typer.echo(f"{metric}: {value:.4f}")
 
     return model
-
-
-# def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
-#     """Model test function, calculate Top-K accuracy for RCA task"""
-#     model.eval()
-#     all_preds = []
-#     all_labels = []
-
-#     with torch.no_grad():
-#         for features, graphs, labels in test_loader:
-#             features = features.to(device)
-#             graphs = graphs.to(device)
-#             # labels = labels.to(device)
-#             labels = torch.argmax(labels, dim=1).to(device)
-
-#             # Model prediction (use sigmoid to get probabilities)
-#             outputs = torch.sigmoid(model(features, graphs))
-
-#             all_preds.append(outputs.cpu().numpy())
-#             all_labels.append(labels.cpu().numpy())
-
-#     # # Concatenate all predictions and labels
-#     # all_preds = np.concatenate(all_preds, axis=0)
-#     # all_labels = np.concatenate(all_labels, axis=0)
-
-#     # # Calculate Top-K accuracy
-#     # results = {}
-#     # top_k_results=[]
-#     # for k in top_k_list:
-#     #     # Ensure k does not exceed number of nodes
-#     #     k = min(k, all_preds.shape[1])
-#     #     correct = 0
-
-#     #     for pred, label in zip(all_preds, all_labels):
-#     #         # Get true root cause positions
-#     #         true_root = np.where(label == 1)[0]
-#     #         if len(true_root) == 0:
-#     #             continue  # Skip samples without label
-
-#     #         # Get top-k nodes with highest predicted probabilities
-#     #         top_k_pred = np.argsort(pred)[-k:][::-1]
-
-#     #         # Check if true root cause is in Top-K
-#     #         if np.any(np.isin(true_root, top_k_pred)):
-#     #             correct += 1
-#     #         if k == 5:
-#     #             top_k_results.append(top_k_pred)
-#     #     accuracy = correct / len(all_preds)
-#     #     results[f"Top-{k} Accuracy"] = accuracy
-#     # print(f"Test Results: {results}")
-#     # return results, top_k_results
-#     all_preds = np.concatenate(all_preds, axis=0)
-#     all_labels = np.concatenate(all_labels, axis=0)
-
-#     # Calculate Top-K accuracy
-#     results = {}
-#     top_k_results = []
-#     for k in top_k_list:
-#         # Ensure k does not exceed number of nodes
-#         k = min(k, all_preds.shape[1])
-#         correct = 0
-
-#         for pred, label in zip(all_preds, all_labels):
-#             # Get true root cause (now a single integer class)
-#             true_root = int(label)  # 直接使用标签值作为类别
-            
-#             # Get top-k nodes with highest predicted probabilities
-#             top_k_pred = np.argsort(pred)[-k:][::-1]
-            
-#             # Check if true root cause is in Top-K predictions
-#             if true_root in top_k_pred:
-#                 correct += 1
-                
-#             if k == 5:
-#                 top_k_results.append(top_k_pred)
-        
-#         accuracy = correct / len(all_preds)
-#         results[f"Top-{k} Accuracy"] = accuracy
-
-#     print(f"Test Results: {results}")
-#     return results, top_k_results
 
 
 def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
@@ -245,19 +222,19 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
     top_k_results = []
 
     with torch.no_grad():
-        for features, graphs, labels in test_loader:
+        for features, graphs, normal_features, normal_graphs, labels in test_loader:
             features = features.to(device)
             graphs = graphs.to(device)
             labels = torch.argmax(labels, dim=1).to(device)
 
-            logits = model(features, graphs)
+            logits,_ = model(features, graphs)
             outputs = torch.sigmoid(logits)
 
             all_preds.append(outputs.cpu().numpy())
             all_logits.append(logits.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
 
-            # 支持 batch 多个图
+            # Support batch multiple graphs
             graph_list = dgl.unbatch(graphs)
             pred_batch = outputs.cpu().numpy()
             label_batch = labels.cpu().numpy()
@@ -277,18 +254,18 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
                         f"Top-{k} Accuracy": hit_raw,
                     })
 
-                    # 收集所有 k 值的 top_k_nodes，而不仅是 k=5
+                    # Collect top_k_nodes for all k values, not just k=5
                     if k == 5:
                         top_k_results.append(top_k_nodes)
 
-    # 聚合统计
+    # Aggregate statistics
     results = {}
     for k in top_k_list:
-        # 过滤出所有与当前 k 值相关的结果
+    # Filter out all results related to the current k value
         k_specific_results = [res for res in all_rerank_results 
                              if any(f"Top-{k} Accuracy" in key for key in res)]
         if not k_specific_results:
-            print(f"警告: 没有找到 Top-{k} 的结果")
+            print(f"Warning: No results found for Top-{k}")
             continue
             
         raw_acc = np.mean([res[f"Top-{k} Accuracy"] for res in k_specific_results])
@@ -305,67 +282,67 @@ def test_model(model, test_loader, device, top_k_list=[1, 3, 5]):
 
 def rerank_nodes_with_coverage_inbound(top_k_nodes, pred_scores, g, alpha=0.7, max_depth=None):
     """
-    在 top-k 节点中，利用结构性传播关系进行 re-ranking。
-    对于每个节点，计算它沿着前驱边(predecessors)链路中包含的top-k节点数量。
-    
-    参数:
-        top_k_nodes: 初始的top-k节点列表
-        pred_scores: 预测分数
-        g: 图结构
-        alpha: 预测分数的权重
-        max_depth: 最大遍历深度，防止过深遍历，None表示不限制
+    Among the top-k nodes, use structural propagation relationships for re-ranking.
+    For each node, calculate the number of top-k nodes contained along the predecessor (predecessors) chain.
+
+    Args:
+        top_k_nodes: initial list of top-k nodes
+        pred_scores: prediction scores
+        g: graph structure
+        alpha: weight of prediction scores
+        max_depth: maximum traversal depth to prevent too deep traversal, None means no limit
     """
     influence_counts = []
     top_k_set = set(top_k_nodes)
 
     for node in top_k_nodes:
-        # 存储已访问过的节点，防止循环遍历
+    # Store visited nodes to prevent circular traversal
         visited = set()
-        # 待遍历的节点队列，格式为(当前节点, 当前深度)
+    # Queue of nodes to be traversed, format: (current node, current depth)
         queue = [(node, 0)]
-        # 计数链路中包含的top-k节点
+    # Count the number of top-k nodes contained in the chain
         count = 0
         
         while queue:
-            current_node, depth = queue.pop(0)  # 广度优先遍历
+            current_node, depth = queue.pop(0)  # Breadth-first traversal
             
-            # 检查是否超过最大深度
+            # Check if maximum depth is exceeded
             if max_depth is not None and depth > max_depth:
                 continue
                 
-            # 如果当前节点在top_k_set中且未被计数过
+            # If the current node is in top_k_set and has not been counted
             if current_node in top_k_set and current_node not in visited:
                 count += 1
                 visited.add(current_node)
-            # 获取前驱节点并继续遍历
+            # Get predecessor nodes and continue traversal
             predecessors = g.predecessors(current_node).numpy()
             for pred in predecessors:
                 if pred not in visited:
                     queue.append((pred, depth + 1))
         
-        # 减去1是因为包含了节点本身，根据需求决定是否保留
+    # Subtract 1 because it includes the node itself, decide whether to keep it as needed
         influence_counts.append(count - 1 if count > 0 else 0)
 
     coverages = influence_counts
     
-    # 提取top_k节点对应的预测分数
+    # Extract prediction scores corresponding to top_k nodes
     node_scores = [pred_scores[node] for node in top_k_nodes]
     
-    # 标准化预测分数 (min-max标准化到[0,1]范围)
+    # Normalize prediction scores (min-max normalization to [0,1] range)
     min_score, max_score = min(node_scores), max(node_scores)
-    if max_score > min_score:  # 避免除以零
+    if max_score > min_score:  # Avoid division by zero
         normalized_scores = [(s - min_score) / (max_score - min_score) for s in node_scores]
-    else:  # 所有分数都相同的情况
-        normalized_scores = [0.5 for _ in node_scores]  # 都赋予中间值
+    else:  # All scores are the same
+        normalized_scores = [0.5 for _ in node_scores]  # All assigned middle value
     
-    # 标准化覆盖率 (min-max标准化到[0,1]范围)
+    # Normalize coverage (min-max normalization to [0,1] range)
     min_cov, max_cov = min(coverages), max(coverages)
-    if max_cov > min_cov:  # 避免除以零
+    if max_cov > min_cov:  # Avoid division by zero
         normalized_coverages = [(c - min_cov) / (max_cov - min_cov) for c in coverages]
-    else:  # 所有覆盖率都相同的情况
-        normalized_coverages = [0.5 for _ in coverages]  # 都赋予中间值
+    else:  # All coverages are the same
+        normalized_coverages = [0.5 for _ in coverages]  # All assigned middle value
     
-    # 使用标准化后的值计算最终分数
+    # Use normalized values to calculate the final score
     final_scores = [
         alpha * norm_score + (1 - alpha) * norm_cov
         for norm_score, norm_cov in zip(normalized_scores, normalized_coverages)
@@ -382,18 +359,18 @@ def predict_single_case(model, features, graph, device, node_names=None):
     model.eval()
 
     with torch.no_grad():
-        # Ensure input shape is [1, time_window, nodes, metrics]
+    # Ensure input shape is [1, time_window, nodes, metrics]
         if features.dim() == 3:
             features = features.unsqueeze(0)
 
         features = features.to(device)
         graph = graph.to(device)
 
-        # Model prediction
+    # Model prediction
         outputs = torch.sigmoid(model(features, graph))
         probs = outputs.squeeze(0).cpu().numpy()  # [num_nodes]
 
-        # Get prediction results
+    # Get prediction results
         top_k_indices = np.argsort(probs)[::-1]  # Descending order by probability
 
         results = []
@@ -438,16 +415,6 @@ def prepare_data_loaders(train_dataset, test_dataset, batch_size=32, train_ratio
     train_dataset1, val_dataset = random_split(
         train_dataset, [train_size, val_size]
     )
-    # from torch.utils.data import Subset
-
-    # # 按顺序分割数据集（假设 dataset 是 RCADataset 实例）
-    # train_size = int(0.7 * len(dataset))
-    # val_size = int(0.3 * len(dataset))
-
-    # # 创建连续索引的子集
-    # train_dataset = Subset(dataset, indices=range(0, train_size))
-    # val_dataset = Subset(dataset, indices=range(train_size, train_size + val_size))
-    # test_dataset = Subset(dataset, indices=range(train_size + val_size, len(dataset)))
 
     # Create data loaders
     train_loader = DataLoader(

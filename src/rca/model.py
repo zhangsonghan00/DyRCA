@@ -181,7 +181,9 @@ class RCAModel(nn.Module):
             nn.Linear(num_services * 2, num_services),
         )
 
-    def forward(self, features: torch.Tensor, graph: dgl.DGLGraph) -> torch.Tensor:
+    from typing import Tuple
+
+    def forward(self, features: torch.Tensor, graph: dgl.DGLGraph) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Input:
             features: [window_size, num_nodes, feature_dim] temporal features
@@ -229,7 +231,7 @@ class RCAModel(nn.Module):
         )  # [batch_size, num_services]
 
         root_cause_scores = self.rca(root_cause_scores)  # [batch_size, num_services]
-        return root_cause_scores
+        return root_cause_scores,graph_features
 
 
 if __name__ == "__main__":
