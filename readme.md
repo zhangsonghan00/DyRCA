@@ -1,6 +1,6 @@
-# DyRCA: Dynamic-Aware Framework for Root Cause Analysis in Microservice Systems
+# DyRCA: A Dynamic-Aware Framework for Root Cause Analysis in Microservice Systems
 
-This repository provides supplemental material (including source code and data) for the paper **"DyRCA, a dynamic-aware framework for root cause analysis in microservice systems"**. Follow the steps below to replicate the experimental results presented in the paper.
+This repository provides supplemental material (including source code and data) for the paper **"DyRCA: A Dynamic-Aware Framework for Root Cause Analysis in Microservice Systems"**. Follow the steps below to replicate the experimental results presented in the paper.
 
 
 ## 1. Environment Setup
